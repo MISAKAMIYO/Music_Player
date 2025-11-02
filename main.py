@@ -25,6 +25,7 @@ import threading
 import numpy as np
 import websockets  
 import uuid     
+from float_window import FloatWindow
 from flask import Flask, request, jsonify, send_from_directory
 from bs4 import BeautifulSoup
 from PyQt5.QtWebSockets import QWebSocket
@@ -36,7 +37,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import (
     QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage, 
-    QPalette, QPixmap, QCursor
+    QPalette, QPen, QPixmap, QCursor
 )
 from PyQt5.QtMultimedia import QMediaContent, QMediaMetaData, QMediaPlayer
 from PyQt5.QtWidgets import (
@@ -300,8 +301,6 @@ def ensure_settings_file_exists():
     if not os.path.exists(settings_path):
         logger.warning("settings.json 文件不存在，创建默认设置")
         save_settings(load_default_settings())
-
-# =============== 设置管理功能结束 ===============
 
 # =============== 日志配置 ===============
 class UTF8StreamHandler(logging.StreamHandler):
@@ -794,36 +793,102 @@ class AudioAPI(QObject):
             logging.error(f"获取音频信息失败: {e}")
             return None
 
-    async def download_audio(self, bvid: str, file_path: str):
-        """下载音频文件"""
+    async def download_audio(self, bvid: str, file_path: str) -> bool:
+        """下载B站音频并保存到指定路径"""
         try:
+            # 获取音频信息
             audio_info = await self.get_audio_info(bvid)
             if not audio_info:
                 return False
-            audio_url = audio_info["audio_url"]
+                
+            # 从用户选择的文件路径中提取目录和基本文件名（不含扩展名）
+            directory = os.path.dirname(file_path)
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
             
+            # 使用安全的文件名
+            safe_name = self.safe_filename(base_name)
+            
+            # 下载音频文件
+            audio_url = audio_info["audio_url"]
+            temp_file = os.path.join(directory, f"temp_{safe_name}")
+            
+            # 下载文件
+            success = await self._download_audio_file(audio_url, temp_file)
+            if not success:
+                return False
+                
+            # 确定文件扩展名
+            content_type = await self.get_content_type(audio_url)
+            if 'm4a' in content_type:
+                ext = '.m4a'
+            elif 'mp3' in content_type:
+                ext = '.mp3'
+            elif 'flac' in content_type:
+                ext = '.flac'
+            else:
+                # 默认使用m4a
+                ext = '.m4a'
+            
+            # 构建最终文件名
+            final_path = os.path.join(directory, f"{safe_name}{ext}")
+            
+            # 重命名文件
+            if os.path.exists(temp_file):
+                os.rename(temp_file, final_path)
+                return True
+            return False
+            
+        except Exception as e:
+            logging.error(f"下载音频失败: {e}")
+            return False
+        
+    async def _download_audio_file(self, url: str, file_path: str) -> bool:
+        """下载音频文件到指定路径"""
+        try:
             async with httpx.AsyncClient() as client:
-                async with client.stream("GET", audio_url, headers=self.BILIBILI_HEADER) as response:
+                async with client.stream("GET", url, headers=self.BILIBILI_HEADER) as response:
                     if response.status_code != 200:
                         return False
-                    total_size = int(response.headers.get("Content-Length", 0))
+                        
+                    total_size = int(response.headers.get("content-length", 0))
                     downloaded = 0
                     
                     async with aiofiles.open(file_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            if self.thread() and self.thread().isInterruptionRequested():
-                                logging.info("下载被中断")
-                                return False
-                            await f.write(chunk)
+                        async for chunk in response.aiter_bytes():
                             downloaded += len(chunk)
+                            await f.write(chunk)
+                            
+                            # 发射下载进度
                             if total_size > 0:
-                                progress = int(100 * downloaded / total_size)
+                                progress = int(downloaded / total_size * 100)
                                 self.download_progress.emit(progress)
-            return True
+                                
+                    return True
         except Exception as e:
-            logging.error(f"音频下载失败: {e}")
+            logging.error(f"下载文件失败: {e}")
             return False
+    
+    async def get_content_type(self, url: str) -> str:
+        """获取URL的内容类型"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.head(url, headers=self.BILIBILI_HEADER)
+                return response.headers.get("content-type", "")
+        except:
+            return ""
 
+    def safe_filename(self, filename):
+        """确保文件名安全，移除非法字符"""
+        # 移除非法字符
+        illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+        for char in illegal_chars:
+            filename = filename.replace(char, '_')
+        
+        # 限制文件名长度
+        if len(filename) > 100:
+            filename = filename[:100]
+        
+        return filename
 
 class AudioSearchDialog(QDialog):
     """Bilibili音频搜索对话框"""
@@ -1076,9 +1141,28 @@ class AudioDownloadThread(QThread):
             if self.isInterruptionRequested():
                 return
             if success:
-                self.download_complete.emit(self.file_path)
+                # 获取最终的保存路径（可能与原始路径不同，因为扩展名可能改变）
+                directory = os.path.dirname(self.file_path)
+                base_name = os.path.splitext(os.path.basename(self.file_path))[0]
+                safe_name = self.audio_api.safe_filename(base_name)
+                
+                # 尝试确定最终文件路径
+                possible_exts = ['.m4a', '.mp3', '.flac']
+                final_path = None
+                
+                for ext in possible_exts:
+                    test_path = os.path.join(directory, f"{safe_name}{ext}")
+                    if os.path.exists(test_path):
+                        final_path = test_path
+                        break
+                
+                if final_path:
+                    self.download_complete.emit(final_path)
+                else:
+                    self.error_occurred.emit("下载完成但找不到文件")
             else:
                 self.error_occurred.emit("音频下载失败")
+                
         except Exception as e:
             self.error_occurred.emit(str(e))
         finally:
@@ -1161,6 +1245,920 @@ class PlaylistManager:
             else:
                 self.play_song_by_index(0)
 
+# =============== 设置对话框 ===============
+class SettingsDialog(QDialog):
+    lyrics_settings_updated = pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setGeometry(200, 200, 700, 500)
+        self.settings = load_settings()
+        self.parent = parent
+        self.show_translation_check = QCheckBox("显示歌词翻译")
+        self.main_layout = QVBoxLayout
+
+        self.init_ui()
+        self.load_settings()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+        self.tabs = QTabWidget()
+        
+        # 第一页：保存位置
+        save_tab = QWidget()
+        save_layout = QVBoxLayout()
+        save_group = QGroupBox("保存位置设置")
+        save_form = QFormLayout()
+        
+        self.music_dir_edit = QLineEdit()
+        self.music_dir_btn = QPushButton("浏览...")
+        self.music_dir_btn.clicked.connect(lambda: self.select_directory(self.music_dir_edit))
+        
+        self.cache_dir_edit = QLineEdit()
+        self.cache_dir_btn = QPushButton("浏览...")
+        self.cache_dir_btn.clicked.connect(lambda: self.select_directory(self.cache_dir_edit))
+        
+        self.video_dir_edit = QLineEdit()
+        self.video_dir_btn = QPushButton("浏览...")
+        self.video_dir_btn.clicked.connect(lambda: self.select_directory(self.video_dir_edit))
+        
+        save_form.addRow("音乐保存位置:", self.create_dir_row(self.music_dir_edit, self.music_dir_btn))
+        save_form.addRow("缓存文件位置:", self.create_dir_row(self.cache_dir_edit, self.cache_dir_btn))
+        save_form.addRow("视频保存位置:", self.create_dir_row(self.video_dir_edit, self.video_dir_btn))
+        save_group.setLayout(save_form)
+        
+        # 背景图片设置
+        bg_group = QGroupBox("背景设置")
+        bg_layout = QVBoxLayout()
+        self.bg_image_edit = QLineEdit()
+        self.bg_image_btn = QPushButton("浏览...")
+        self.bg_image_btn.clicked.connect(lambda: self.select_image(self.bg_image_edit))
+        self.bg_preview_btn = QPushButton("预览")
+        self.bg_preview_btn.clicked.connect(self.preview_background)
+        bg_row = QHBoxLayout()
+        bg_row.addWidget(self.bg_image_edit)
+        bg_row.addWidget(self.bg_image_btn)
+        bg_row.addWidget(self.bg_preview_btn)
+        bg_layout.addLayout(bg_row)
+        bg_group.setLayout(bg_layout)
+        
+        # 其他设置
+        other_group = QGroupBox("其他设置")
+        other_form = QFormLayout()
+        self.max_results_spin = QSpinBox()
+        self.max_results_spin.setRange(5, 100)
+        self.auto_play_check = QCheckBox("下载后自动播放")
+        other_form.addRow("最大获取数量:", self.max_results_spin)
+        other_form.addRow(self.auto_play_check)
+        other_group.setLayout(other_form)
+        other_form.addRow(self.show_translation_check)
+        save_layout.addWidget(save_group)
+        save_layout.addWidget(bg_group)
+        save_layout.addWidget(other_group)
+        save_layout.addStretch()
+        save_tab.setLayout(save_layout)
+        
+        # 第二页：音源设置
+        source_tab = QWidget()
+        source_layout = QVBoxLayout()
+        source_group = QGroupBox("当前音源")
+        source_form = QFormLayout()
+        source_management_layout = QHBoxLayout()
+        self.add_source_button = QPushButton("添加音源")
+        self.add_source_button.clicked.connect(self.add_music_source)
+        self.remove_source_button = QPushButton("移除音源")
+        self.remove_source_button.clicked.connect(self.remove_music_source)
+        source_management_layout.addWidget(self.add_source_button)
+        source_management_layout.addWidget(self.remove_source_button)
+        source_layout.addLayout(source_management_layout)
+
+        # 音源选择
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(get_source_names())
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText("如需API密钥请在此输入")
+        source_form.addRow("选择音源:", self.source_combo)
+        source_form.addRow("API密钥:", self.api_key_edit)
+        source_group.setLayout(source_form)
+        source_layout.addWidget(source_group)
+        
+        # 测试连接和DNS刷新按钮
+        test_button = QPushButton("测试连接")
+        test_button.clicked.connect(self.test_api_connection)
+        source_form.addRow(test_button)
+        
+        dns_button = QPushButton("刷新DNS缓存")
+        dns_button.clicked.connect(self.refresh_dns_cache)
+        source_form.addRow(dns_button)
+                
+        source_tab.setLayout(source_layout)
+        
+        # 第三页：Bilibili设置
+        bilibili_tab = QWidget()
+        bilibili_layout = QVBoxLayout()
+        bilibili_group = QGroupBox("Bilibili设置")
+        bilibili_form = QFormLayout()
+        self.bilibili_cookie_edit = QLineEdit()
+        self.bilibili_cookie_edit.setPlaceholderText("输入Bilibili Cookie（可选）")
+        self.max_duration_spin = QSpinBox()
+        self.max_duration_spin.setRange(60, 3600)
+        self.max_duration_spin.setSuffix("秒")
+        bilibili_form.addRow("Cookie:", self.bilibili_cookie_edit)
+        bilibili_form.addRow("最大下载时长:", self.max_duration_spin)
+        bilibili_group.setLayout(bilibili_form)
+        bilibili_layout.addWidget(bilibili_group)
+        
+        # Bilibili视频搜索按钮
+        bilibili_button_layout = QHBoxLayout()
+        self.bilibili_video_button = QPushButton("搜索B站视频")
+        self.bilibili_video_button.setStyleSheet("padding: 8px; background-color: rgba(219, 68, 83, 200); color: white; font-weight: bold;")
+        self.bilibili_video_button.clicked.connect(self.open_bilibili_video_search)
+        bilibili_button_layout.addWidget(self.bilibili_video_button)
+        bilibili_layout.addLayout(bilibili_button_layout)
+        bilibili_tab.setLayout(bilibili_layout)
+        
+        # 第四页：作者主页
+        author_tab = QWidget()
+        author_layout = QVBoxLayout()   
+        author_info = QLabel("欢迎使用Railgun_lover的音乐项目！")
+        author_info.setStyleSheet("font-size: 16px; font-weight: bold; margin: 10px;")
+        author_layout.addWidget(author_info, alignment=Qt.AlignCenter)
+
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        bilibili_button = QPushButton("访问B站主页")
+        bilibili_button.setStyleSheet("""
+            QPushButton {
+                padding: 12px;
+                font-size: 14px;
+                background-color: #FB7299;
+                color: white;
+                border-radius: 6px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #FF85AD;
+            }
+        """)
+        bilibili_button.setCursor(QCursor(Qt.PointingHandCursor))
+        bilibili_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(
+            "https://space.bilibili.com/1411318075?spm_id_from=333.1007.0.0"
+        )))
+        
+        github_button = QPushButton("访问GitHub项目")
+        github_button.setStyleSheet("""
+            QPushButton {
+                padding: 12px;
+                font-size: 14px;
+                background-color: #6e5494;
+                color: white;
+                border-radius: 6px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #836EAA;
+            }
+        """)
+        github_button.setCursor(QCursor(Qt.PointingHandCursor))
+        github_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(
+            "https://github.com/MISAKAMIYO/Music_Player"
+        )))
+        
+        button_layout.addWidget(bilibili_button)
+        button_layout.addStretch()
+        button_layout.addWidget(github_button)
+        author_layout.addLayout(button_layout)
+    
+        # 分隔线
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setLineWidth(1)
+        author_layout.addWidget(separator)
+    
+        # 联系信息
+        contact_info = QLabel("项目开源免费，欢迎使用和交流！")
+        contact_info.setStyleSheet("font-size: 14px; color: #888888; margin-top: 15px;")
+        contact_info.setAlignment(Qt.AlignCenter)
+        author_layout.addWidget(contact_info)
+        author_tab.setLayout(author_layout)
+        
+        # 添加标签页
+        self.tabs.addTab(save_tab, "保存设置")
+        self.tabs.addTab(source_tab, "音源设置")
+        self.tabs.addTab(bilibili_tab, "Bilibili设置")
+        self.tabs.addTab(author_tab, "作者主页")
+        
+        # 按钮
+        button_layout = QHBoxLayout()
+        self.save_btn = QPushButton("保存")
+        self.save_btn.clicked.connect(self.save_settings)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addStretch()
+        button_layout.addWidget(self.save_btn)
+        button_layout.addWidget(self.cancel_btn)
+        layout.addWidget(self.tabs)
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def test_api_connection(self):
+        """测试当前音源API是否可用"""
+        config = get_active_source_config()
+        url = config["url"]
+        
+        # 对于公共音乐API，使用特殊的测试参数
+        if config["name"] == "公共音乐API":
+            test_url = "https://api.railgun.live/music/search?keyword=test&source=kugou&page=1&limit=1"
+            try:
+                response = requests.get(test_url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("code") == 200 and data.get("data"):
+                        QMessageBox.information(self, "测试成功", "公共音乐API连接正常！")
+                    else:
+                        QMessageBox.warning(self, "测试失败", f"API返回错误: {data.get('message', '未知错误')}")
+                else:
+                    QMessageBox.warning(self, "测试失败", f"API返回状态码: {response.status_code}")
+            except Exception as e:
+                QMessageBox.critical(self, "测试失败", f"无法连接到API: {str(e)}")
+        else:
+            # 其他音源的测试逻辑
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    QMessageBox.information(self, "测试成功", f"API连接正常: {url}")
+                else:
+                    QMessageBox.warning(self, "测试失败", f"API返回状态码: {response.status_code}")
+            except Exception as e:
+                QMessageBox.critical(self, "测试失败", f"无法连接到API: {str(e)}")
+        
+    def add_music_source(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("添加新音源")
+        layout = QFormLayout()
+        
+        name_edit = QLineEdit()
+        url_edit = QLineEdit()
+        method_combo = QComboBox()
+        method_combo.addItems(["GET", "POST"])
+        
+        # 新增源类型选择
+        type_label = QLabel("源类型:")
+        type_combo = QComboBox()
+        type_combo.addItems(["标准API", "公共音乐API"])
+    
+        layout.addRow("名称:", name_edit)
+        layout.addRow("URL:", url_edit)
+        layout.addRow("请求方法:", method_combo)
+    
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+    
+        layout.addWidget(button_box)
+        dialog.setLayout(layout)
+    
+        if dialog.exec_() == QDialog.Accepted:
+            source_type = type_combo.currentText()
+            
+            # 根据不同源类型设置不同的默认参数
+            if source_type == "公共音乐API":
+                new_source = {
+                    "name": name_edit.text(),
+                    "url": "https://api.railgun.live/music/search",
+                    "params": {
+                        "keyword": "{query}",
+                        "source": "kugou",
+                        "page": 1,
+                        "limit": 20
+                    },
+                    "method": "GET",
+                    "headers": {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+                    }
+                }
+            else:
+                new_source = {
+                    "name": name_edit.text(),
+                    "url": url_edit.text(),
+                    "method": method_combo.currentText(),
+                    "params": {},
+                    "headers": {}
+                }
+                
+            self.settings["sources"]["sources_list"].append(new_source)
+            self.source_combo.addItem(new_source["name"])
+            # 立即设置为当前音源
+            self.settings["sources"]["active_source"] = new_source["name"]
+            self.source_combo.setCurrentText(new_source["name"])
+
+
+    def remove_music_source(self):
+        current_source = self.source_combo.currentText()
+        if current_source and current_source != "QQ音乐" and current_source != "网易云音乐" and current_source != "酷狗音乐":
+            reply = QMessageBox.question(
+                self, 
+                "确认删除",
+                f"确定要移除音源 '{current_source}' 吗？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                # 从设置中移除
+                self.settings["sources"]["sources_list"] = [
+                    s for s in self.settings["sources"]["sources_list"]
+                    if s["name"] != current_source
+                ]
+                # 从下拉框中移除
+                self.source_combo.removeItem(self.source_combo.currentIndex())
+        
+    def refresh_dns_cache(self):
+        """刷新DNS缓存"""
+        try:
+            if sys.platform == "win32":
+                os.system("ipconfig /flushdns")
+            elif sys.platform == "darwin":
+                os.system("sudo killall -HUP mDNSResponder")
+            else:
+                # Linux使用不同的命令
+                if os.path.exists("/etc/init.d/nscd"):
+                    os.system("sudo /etc/init.d/nscd restart")
+                elif os.path.exists("/usr/bin/systemd-resolve"):
+                    os.system("sudo systemd-resolve --flush-caches")
+                else:
+                    os.system("sudo systemctl restart systemd-resolved.service")
+            QMessageBox.information(self, "成功", "DNS缓存已刷新")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"刷新DNS缓存失败: {str(e)}")
+    
+
+    def open_bilibili_video_search(self):
+        cookie = self.bilibili_cookie_edit.text().strip()
+        dialog = VideoSearchDialog(self, cookie)
+        dialog.exec_()
+        
+    def create_dir_row(self, edit, btn):
+        row_layout = QHBoxLayout()
+        row_layout.addWidget(edit)
+        row_layout.addWidget(btn)
+        widget = QWidget()
+        widget.setLayout(row_layout)
+        return widget
+        
+    def select_directory(self, edit):
+        directory = QFileDialog.getExistingDirectory(self, "选择目录")
+        if directory:
+            edit.setText(directory)
+            
+    def select_image(self, edit):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择背景图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)"
+        )
+        if file_path:
+            edit.setText(file_path)
+
+    def preview_background(self):
+        image_path = self.bg_image_edit.text()
+        if image_path and os.path.exists(image_path):
+            preview_dialog = QDialog(self)
+            preview_dialog.setWindowTitle("背景预览")
+            preview_dialog.setGeometry(300, 300, 600, 400)
+            layout = QVBoxLayout()
+            image_label = QLabel()
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(550, 350, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                image_label.setPixmap(pixmap)
+                image_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(image_label)
+            preview_dialog.setLayout(layout)
+            preview_dialog.exec_()
+        else:
+            QMessageBox.warning(self, "错误", "图片路径无效或文件不存在")
+            
+    def load_settings(self):
+        self.music_dir_edit.setText(self.settings["save_paths"]["music"])
+        self.cache_dir_edit.setText(self.settings["save_paths"]["cache"])
+        self.video_dir_edit.setText(self.settings["save_paths"].get("videos", os.path.join(os.path.expanduser("~"), "Videos")))
+        self.bg_image_edit.setText(self.settings.get("background_image", ""))
+        self.max_results_spin.setValue(self.settings["other"]["max_results"])
+        self.auto_play_check.setChecked(self.settings["other"]["auto_play"])
+        self.source_combo.setCurrentText(self.settings["sources"]["active_source"])
+        active_source = get_active_source_config()
+        self.api_key_edit.setText(active_source.get("api_key", ""))
+        self.bilibili_cookie_edit.setText(self.settings["bilibili"].get("cookie", ""))
+        self.max_duration_spin.setValue(self.settings["bilibili"].get("max_duration", 600))
+
+    def save_settings(self):
+        self.settings["save_paths"]["music"] = self.music_dir_edit.text()
+        self.settings["save_paths"]["cache"] = self.cache_dir_edit.text()
+        self.settings["save_paths"]["videos"] = self.video_dir_edit.text()
+        self.settings["background_image"] = self.bg_image_edit.text()
+        self.settings["other"]["max_results"] = self.max_results_spin.value()
+        self.settings["other"]["auto_play"] = self.auto_play_check.isChecked()
+        active_source = self.source_combo.currentText()
+        self.settings["sources"]["active_source"] = active_source
+        
+        # 更新API密钥
+        for source in self.settings["sources"]["sources_list"]:
+            if source["name"] == active_source:
+                source["api_key"] = self.api_key_edit.text()
+                break
+        
+        # 更新Bilibili设置
+        if "bilibili" not in self.settings:
+            self.settings["bilibili"] = {}
+        self.settings["bilibili"]["cookie"] = self.bilibili_cookie_edit.text()
+        self.settings["bilibili"]["max_duration"] = self.max_duration_spin.value()
+        
+        if save_settings(self.settings):
+            if self.parent:
+               self.parent.refresh_source_combo()
+            self.lyrics_settings_updated.emit()
+            self.accept()
+        else:
+            QMessageBox.warning(self, "错误", "保存设置失败，请检查日志")
+        
+        # 保存设置
+        if save_settings(self.settings):
+            if self.parent:
+               self.parent.refresh_source_combo()
+            self.lyrics_settings_updated.emit()
+            self.accept()
+        else:
+            QMessageBox.warning(self, "错误", "保存设置失败，请检查日志")
+
+# =============== 工具对话框 ===============
+class ToolsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("实用工具")
+        self.setGeometry(300, 300, 600, 400)
+        self.parent = parent
+        self.settings = load_settings()
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout()
+        
+        # 创建标签页
+        self.tabs = QTabWidget()
+        
+        # 歌词工具标签页
+        lyrics_tab = QWidget()
+        lyrics_layout = QVBoxLayout()
+        
+        lyrics_label = QLabel("输入歌词（支持LRC格式）：")
+        lyrics_layout.addWidget(lyrics_label)
+        
+        self.lyrics_input = QTextEdit()
+        self.lyrics_input.setPlaceholderText("输入歌词内容...")
+        lyrics_layout.addWidget(self.lyrics_input)
+        
+        # 图片设置
+        settings_layout = QHBoxLayout()
+        
+        size_layout = QHBoxLayout()
+        size_label = QLabel("图片宽度:")
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(500, 2000)
+        self.width_spin.setValue(1000)
+        size_layout.addWidget(size_label)
+        size_layout.addWidget(self.width_spin)
+        settings_layout.addLayout(size_layout)
+        
+        font_layout = QHBoxLayout()
+        font_label = QLabel("字体大小:")
+        self.font_size = QSpinBox()
+        self.font_size.setRange(10, 50)
+        self.font_size.setValue(30)
+        font_layout.addWidget(font_label)
+        font_layout.addWidget(self.font_size)
+        settings_layout.addLayout(font_layout)
+        
+        lyrics_layout.addLayout(settings_layout)
+        
+        # 生成按钮
+        generate_btn = QPushButton("生成歌词图片")
+        generate_btn.clicked.connect(self.generate_lyrics_image)
+        lyrics_layout.addWidget(generate_btn)
+        
+        # 预览区域
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(200)
+        self.preview_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ddd;")
+        lyrics_layout.addWidget(self.preview_label)
+        
+        lyrics_tab.setLayout(lyrics_layout)
+        
+        # 格式转换标签页
+        convert_tab = QWidget()
+        convert_layout = QVBoxLayout()
+        
+        # 选择文件区域
+        file_layout = QHBoxLayout()
+        
+        self.file_path_edit = QLineEdit()
+        self.file_path_edit.setPlaceholderText("选择音频文件...")
+        
+        browse_btn = QPushButton("浏览...")
+        browse_btn.clicked.connect(self.select_audio_file)
+        file_layout.addWidget(self.file_path_edit)
+        file_layout.addWidget(browse_btn)
+        convert_layout.addLayout(file_layout)
+        
+        # 输出格式选择
+        format_layout = QHBoxLayout()
+        format_label = QLabel("输出格式:")
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP3", "WAV", "FLAC", "M4A"])
+        format_layout.addWidget(format_label)
+        format_layout.addWidget(self.format_combo)
+        convert_layout.addLayout(format_layout)
+        
+        # 转换按钮
+        convert_btn = QPushButton("开始转换")
+        convert_btn.clicked.connect(self.convert_audio)
+        convert_layout.addWidget(convert_btn)
+        
+        # 转换状态
+        self.convert_status = QLabel("")
+        self.convert_status.setAlignment(Qt.AlignCenter)
+        convert_layout.addWidget(self.convert_status)
+        
+        convert_tab.setLayout(convert_layout)
+        
+        # 清理工具标签页
+        clean_tab = QWidget()
+        clean_layout = QVBoxLayout()
+        
+        clean_label = QLabel("清理缓存和临时文件:")
+        clean_layout.addWidget(clean_label)
+        
+        # 清理选项
+        cache_check = QCheckBox("清理歌曲缓存")
+        cache_check.setChecked(True)
+        self.cache_check = cache_check
+        
+        temp_check = QCheckBox("清理临时文件")
+        temp_check.setChecked(True)
+        self.temp_check = temp_check
+        
+        preview_check = QCheckBox("清理预览图片")
+        preview_check.setChecked(True)
+        self.preview_check = preview_check
+        
+        clean_layout.addWidget(cache_check)
+        clean_layout.addWidget(temp_check)
+        clean_layout.addWidget(preview_check)
+        
+        # 随机点名标签页
+        random_tab = QWidget()
+        random_layout = QVBoxLayout()
+        
+        # 名单输入区域
+        name_input_label = QLabel("输入名单（每行一个名字）:")
+        random_layout.addWidget(name_input_label)
+        
+        self.name_list_input = QTextEdit()
+        self.name_list_input.setPlaceholderText("请输入名单，每行一个名字...")
+        random_layout.addWidget(self.name_list_input)
+        
+        # 控制按钮区域
+        control_layout = QHBoxLayout()
+        self.start_random_button = QPushButton("开始随机")
+        self.start_random_button.clicked.connect(self.start_random_selection)
+        control_layout.addWidget(self.start_random_button)
+        
+        self.stop_random_button = QPushButton("停止")
+        self.stop_random_button.setEnabled(False)
+        self.stop_random_button.clicked.connect(self.stop_random_selection)
+        control_layout.addWidget(self.stop_random_button)
+        
+        random_layout.addLayout(control_layout)
+        
+        # 结果显示区域
+        result_layout = QVBoxLayout()
+        result_label = QLabel("随机结果:")
+        result_layout.addWidget(result_label)
+        
+        self.result_display = QLabel("等待开始...")
+        self.result_display.setAlignment(Qt.AlignCenter)
+        self.result_display.setStyleSheet("""
+            QLabel {
+                font-size: 24px;
+                font-weight: bold;
+                padding: 20px;
+                background-color: #f0f0f0;
+                border: 2px solid #ccc;
+                border-radius: 10px;
+            }
+        """)
+        result_layout.addWidget(self.result_display)
+        
+        # 历史记录
+        history_label = QLabel("历史记录:")
+        result_layout.addWidget(history_label)
+        
+        self.history_list = QListWidget()
+        self.history_list.setMaximumHeight(100)
+        result_layout.addWidget(self.history_list)
+        
+        random_layout.addLayout(result_layout)
+        random_tab.setLayout(random_layout)
+        
+        # 将新标签页添加到选项卡中
+        self.tabs.addTab(random_tab, "随机点名")
+        
+        # 初始化随机选择相关变量
+        self.random_timer = QTimer()
+        self.random_timer.timeout.connect(self.update_random_selection)
+        self.name_list = []
+        self.is_randomizing = False
+
+        # 清理按钮
+        clean_btn = QPushButton("开始清理")
+        clean_btn.clicked.connect(self.clean_files)
+        clean_layout.addWidget(clean_btn)
+        
+        # 清理状态
+        self.clean_status = QLabel("")
+        self.clean_status.setAlignment(Qt.AlignCenter)
+        clean_layout.addWidget(self.clean_status)
+        
+        clean_tab.setLayout(clean_layout)
+        
+        # 批量下载标签页
+        batch_tab = QWidget()
+        batch_layout = QVBoxLayout()
+        
+        batch_label = QLabel("批量下载歌曲:")
+        batch_layout.addWidget(batch_label)
+        
+        # 歌曲列表
+        self.song_list = QTextEdit()
+        self.song_list.setPlaceholderText("每行输入一首歌曲名称")
+        batch_layout.addWidget(self.song_list)
+        
+        # 下载按钮
+        download_btn = QPushButton("开始下载")
+        download_btn.clicked.connect(self.batch_download)
+        batch_layout.addWidget(download_btn)
+        
+        # 下载状态
+        self.download_status = QLabel("")
+        self.download_status.setAlignment(Qt.AlignCenter)
+        batch_layout.addWidget(self.download_status)
+        
+        batch_tab.setLayout(batch_layout)
+        
+        # 添加标签页
+        self.tabs.addTab(lyrics_tab, "歌词工具")
+        self.tabs.addTab(convert_tab, "格式转换")
+        self.tabs.addTab(clean_tab, "清理工具")
+        self.tabs.addTab(batch_tab, "批量下载")
+        
+        self.main_layout.addWidget(self.tabs)
+        self.setLayout(layout)
+        
+    def select_audio_file(self):
+        """选择音频文件"""
+        music_dir = self.settings["save_paths"]["music"]
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择音频文件", music_dir, 
+            "音频文件 (*.mp3 *.wav *.flac *.m4a);;所有文件 (*.*)"
+        )
+        
+        if file_path:
+            self.file_path_edit.setText(file_path)
+    
+    def start_random_selection(self):
+        """开始随机选择"""
+        # 获取名单
+        text = self.name_list_input.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "请输入名单")
+            return
+        
+        self.name_list = [name.strip() for name in text.split('\n') if name.strip()]
+        if len(self.name_list) < 2:
+            QMessageBox.warning(self, "提示", "至少需要两个名字")
+            return
+
+        # 更新按钮状态
+        self.start_random_button.setEnabled(False)
+        self.stop_random_button.setEnabled(True)
+        
+        # 开始随机选择
+        self.is_randomizing = True
+        self.random_timer.start(100)  # 每100毫秒更新一次
+        
+    def stop_random_selection(self):
+        """停止随机选择"""
+        self.random_timer.stop()
+        self.is_randomizing = False
+        
+        # 更新按钮状态
+        self.start_random_button.setEnabled(True)
+        self.stop_random_button.setEnabled(False)
+        
+        # 记录结果
+        current_result = self.result_display.text()
+        if current_result and current_result != "等待开始...":
+            self.history_list.addItem(f"{datetime.datetime.now().strftime('%H:%M:%S')} - {current_result}")
+        
+    def update_random_selection(self):
+        """更新随机选择显示"""
+        if self.name_list:
+            random_index = random.randint(0, len(self.name_list) - 1)
+            selected_name = self.name_list[random_index]
+            
+            # 添加一些视觉效果
+            if random.random() > 0.7:  # 30%的概率改变颜色
+                color = random.choice(["#FF0000", "#00FF00", "#0000FF", "#FF00FF", "#FFFF00"])
+                self.result_display.setStyleSheet(f"""
+                    QLabel {{
+                        font-size: 24px;
+                        font-weight: bold;
+                        padding: 20px;
+                        background-color: #f0f0f0;
+                        border: 2px solid {color};
+                        border-radius: 10px;
+                        color: {color};
+                    }}
+                """)
+            else:
+                self.result_display.setStyleSheet("""
+                    QLabel {
+                        font-size: 24px;
+                        font-weight: bold;
+                        padding: 20px;
+                        background-color: #f0f0f0;
+                        border: 2px solid #ccc;
+                        border-radius: 10px;
+                    }
+                """)
+            
+            self.result_display.setText(selected_name)
+
+    def generate_lyrics_image(self):
+        """生成歌词图片"""
+        lyrics = self.lyrics_input.toPlainText().strip()
+        if not lyrics:
+            QMessageBox.warning(self, "提示", "请输入歌词内容")
+            return
+            
+        width = self.width_spin.value()
+        font_size = self.font_size.value()
+        
+        try:
+            img_data = draw_lyrics(lyrics, image_width=width, font_size=font_size)
+            
+            # 创建预览
+            pixmap = QPixmap()
+            pixmap.loadFromData(img_data)
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(550, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.preview_label.setPixmap(pixmap)
+            else:
+                QMessageBox.warning(self, "错误", "生成预览失败")
+                return
+                
+            # 保存图片
+            cache_dir = self.settings["save_paths"]["cache"]
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存歌词图片", 
+                os.path.join(cache_dir, "lyrics.jpg"), 
+                "JPEG图片 (*.jpg)"
+            )
+            
+            if file_path:
+                with open(file_path, "wb") as f:
+                    f.write(img_data)
+                QMessageBox.information(self, "成功", f"歌词图片已保存到:\n{file_path}")
+                
+        except Exception as e:
+            logger.error(f"生成歌词图片失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"生成失败: {str(e)}")
+            
+    def convert_audio(self):
+        """转换音频格式"""
+        input_path = self.file_path_edit.text().strip()
+        if not input_path or not os.path.exists(input_path):
+            QMessageBox.warning(self, "错误", "请选择有效的音频文件")
+            return
+            
+        output_format = self.format_combo.currentText().lower()
+        output_dir = os.path.dirname(input_path)
+        filename = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(output_dir, f"{filename}.{output_format}")
+        
+        try:
+            self.convert_status.setText("正在转换...")
+            QApplication.processEvents()
+            
+            # 实际转换逻辑
+            if sys.platform == "win32":
+                command = f'ffmpeg -i "{input_path}" "{output_path}"'
+                subprocess.run(command, shell=True, check=True)
+            else:
+                command = ['ffmpeg', '-i', input_path, output_path]
+                subprocess.run(command, check=True)
+                
+            self.convert_status.setText(f"转换成功: {output_path}")
+            QMessageBox.information(self, "成功", f"文件已转换为 {output_format.upper()} 格式:\n{output_path}")
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"音频转换失败: {str(e)}")
+            self.convert_status.setText(f"转换失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"转换失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"音频转换失败: {str(e)}")
+            self.convert_status.setText(f"转换失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"转换失败: {str(e)}")
+            
+    def clean_files(self):
+        """清理缓存和临时文件"""
+        try:
+            cache_dir = self.settings["save_paths"]["cache"]
+            temp_dir = os.path.abspath(os.path.join("data", "temp"))
+            
+            total_size = 0
+            file_count = 0
+            
+            # 清理歌曲缓存
+            if self.cache_check.isChecked():
+                for file in Path(cache_dir).glob("*.*"):
+                    if file.is_file():
+                        total_size += file.stat().st_size
+                        file.unlink()
+                        file_count += 1
+            
+            # 清理临时文件
+            if self.temp_check.isChecked() and os.path.exists(temp_dir):
+                for file in Path(temp_dir).rglob("*.*"):
+                    if file.is_file():
+                        total_size += file.stat().st_size
+                        file.unlink()
+                        file_count += 1
+            
+            # 清理预览图片
+            if self.preview_check.isChecked():
+                preview_dir = os.path.abspath(os.path.join("data", "previews"))
+                if os.path.exists(preview_dir):
+                    for file in Path(preview_dir).rglob("*.*"):
+                        if file.is_file():
+                            total_size += file.stat().st_size
+                            file.unlink()
+                            file_count += 1
+            
+            # 显示清理结果
+            size_mb = total_size / (1024 * 1024)
+            self.clean_status.setText(f"已清理 {file_count} 个文件，释放 {size_mb:.2f} MB 空间")
+            QMessageBox.information(self, "成功", f"清理完成:\n已清理 {file_count} 个文件\n释放 {size_mb:.2f} MB 空间")
+            
+        except Exception as e:
+            logger.error(f"清理文件失败: {str(e)}")
+            self.clean_status.setText(f"清理失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"清理失败: {str(e)}")
+            
+    def batch_download(self):
+        """批量下载歌曲"""
+        song_names = self.song_list.toPlainText().strip().splitlines()
+        if not song_names:
+            QMessageBox.warning(self, "提示", "请输入歌曲名称")
+            return
+            
+        # 创建进度对话框
+        self.progress_dialog = QProgressDialog("批量下载歌曲...", "取消", 0, len(song_names), self)
+        self.progress_dialog.setWindowTitle("批量下载")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.canceled.connect(self.cancel_batch_download)
+        self.progress_dialog.show()
+        
+        # 创建工作线程
+        self.batch_worker = BatchDownloadWorker(song_names)
+        self.batch_worker.progress_updated.connect(self.update_batch_progress)
+        self.batch_worker.finished.connect(self.batch_download_completed)
+        self.batch_worker.start()
+        
+    def update_batch_progress(self, current, total, song_name):
+        """更新批量下载进度"""
+        self.progress_dialog.setValue(current)
+        self.progress_dialog.setLabelText(f"正在下载: {song_name}\n进度: {current}/{total}")
+        
+    def batch_download_completed(self):
+        """批量下载完成"""
+        self.progress_dialog.close()
+        self.download_status.setText(f"批量下载完成: {self.batch_worker.success_count} 首成功, {self.batch_worker.fail_count} 首失败")
+        QMessageBox.information(self, "完成", f"批量下载完成:\n成功: {self.batch_worker.success_count} 首\n失败: {self.batch_worker.fail_count} 首")
+        
+    def cancel_batch_download(self):
+        """取消批量下载"""
+        if hasattr(self, 'batch_worker') and self.batch_worker.isRunning():
+            self.batch_worker.requestInterruption()
+            self.download_status.setText("批量下载已取消")
 
 class PlaylistDialog(QDialog):
     def __init__(self, playlist_manager, parent=None):
@@ -2240,456 +3238,6 @@ class MusicWorker(QThread):
     
         # 默认返回0
         return 0
-
-# =============== 设置对话框 ===============
-class SettingsDialog(QDialog):
-    lyrics_settings_updated = pyqtSignal()
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("设置")
-        self.setGeometry(200, 200, 700, 500)
-        self.settings = load_settings()
-        self.parent = parent
-        self.show_translation_check = QCheckBox("显示歌词翻译")
-        # 在设置对话框中添加手机IP配置
-        phone_layout = QHBoxLayout()
-        phone_layout.addWidget(QLabel("手机IP地址:"))
-        self.phone_ip_edit = QLineEdit()
-        self.phone_ip_edit.setPlaceholderText("输入手机IP地址")
-        phone_layout.addWidget(self.phone_ip_edit)
-        QLayout.addLayout(phone_layout)
-        self.init_ui()
-        self.load_settings()
-
-    def init_ui(self):
-        layout = QVBoxLayout()
-        self.tabs = QTabWidget()
-        
-        # 第一页：保存位置
-        save_tab = QWidget()
-        save_layout = QVBoxLayout()
-        save_group = QGroupBox("保存位置设置")
-        save_form = QFormLayout()
-        
-        self.music_dir_edit = QLineEdit()
-        self.music_dir_btn = QPushButton("浏览...")
-        self.music_dir_btn.clicked.connect(lambda: self.select_directory(self.music_dir_edit))
-        
-        self.cache_dir_edit = QLineEdit()
-        self.cache_dir_btn = QPushButton("浏览...")
-        self.cache_dir_btn.clicked.connect(lambda: self.select_directory(self.cache_dir_edit))
-        
-        self.video_dir_edit = QLineEdit()
-        self.video_dir_btn = QPushButton("浏览...")
-        self.video_dir_btn.clicked.connect(lambda: self.select_directory(self.video_dir_edit))
-        
-        save_form.addRow("音乐保存位置:", self.create_dir_row(self.music_dir_edit, self.music_dir_btn))
-        save_form.addRow("缓存文件位置:", self.create_dir_row(self.cache_dir_edit, self.cache_dir_btn))
-        save_form.addRow("视频保存位置:", self.create_dir_row(self.video_dir_edit, self.video_dir_btn))
-        save_group.setLayout(save_form)
-        
-        # 背景图片设置
-        bg_group = QGroupBox("背景设置")
-        bg_layout = QVBoxLayout()
-        self.bg_image_edit = QLineEdit()
-        self.bg_image_btn = QPushButton("浏览...")
-        self.bg_image_btn.clicked.connect(lambda: self.select_image(self.bg_image_edit))
-        self.bg_preview_btn = QPushButton("预览")
-        self.bg_preview_btn.clicked.connect(self.preview_background)
-        bg_row = QHBoxLayout()
-        bg_row.addWidget(self.bg_image_edit)
-        bg_row.addWidget(self.bg_image_btn)
-        bg_row.addWidget(self.bg_preview_btn)
-        bg_layout.addLayout(bg_row)
-        bg_group.setLayout(bg_layout)
-        
-        # 其他设置
-        other_group = QGroupBox("其他设置")
-        other_form = QFormLayout()
-        self.max_results_spin = QSpinBox()
-        self.max_results_spin.setRange(5, 100)
-        self.auto_play_check = QCheckBox("下载后自动播放")
-        other_form.addRow("最大获取数量:", self.max_results_spin)
-        other_form.addRow(self.auto_play_check)
-        other_group.setLayout(other_form)
-        other_form.addRow(self.show_translation_check)
-        save_layout.addWidget(save_group)
-        save_layout.addWidget(bg_group)
-        save_layout.addWidget(other_group)
-        save_layout.addStretch()
-        save_tab.setLayout(save_layout)
-        
-        # 第二页：音源设置
-        source_tab = QWidget()
-        source_layout = QVBoxLayout()
-        source_group = QGroupBox("当前音源")
-        source_form = QFormLayout()
-        source_management_layout = QHBoxLayout()
-        self.add_source_button = QPushButton("添加音源")
-        self.add_source_button.clicked.connect(self.add_music_source)
-        self.remove_source_button = QPushButton("移除音源")
-        self.remove_source_button.clicked.connect(self.remove_music_source)
-        source_management_layout.addWidget(self.add_source_button)
-        source_management_layout.addWidget(self.remove_source_button)
-        source_layout.addLayout(source_management_layout)
-
-        # 音源选择
-        self.source_combo = QComboBox()
-        self.source_combo.addItems(get_source_names())
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setPlaceholderText("如需API密钥请在此输入")
-        source_form.addRow("选择音源:", self.source_combo)
-        source_form.addRow("API密钥:", self.api_key_edit)
-        source_group.setLayout(source_form)
-        source_layout.addWidget(source_group)
-        
-        # 测试连接和DNS刷新按钮
-        test_button = QPushButton("测试连接")
-        test_button.clicked.connect(self.test_api_connection)
-        source_form.addRow(test_button)
-        
-        dns_button = QPushButton("刷新DNS缓存")
-        dns_button.clicked.connect(self.refresh_dns_cache)
-        source_form.addRow(dns_button)
-                
-        source_tab.setLayout(source_layout)
-        
-        # 第三页：Bilibili设置
-        bilibili_tab = QWidget()
-        bilibili_layout = QVBoxLayout()
-        bilibili_group = QGroupBox("Bilibili设置")
-        bilibili_form = QFormLayout()
-        self.bilibili_cookie_edit = QLineEdit()
-        self.bilibili_cookie_edit.setPlaceholderText("输入Bilibili Cookie（可选）")
-        self.max_duration_spin = QSpinBox()
-        self.max_duration_spin.setRange(60, 3600)
-        self.max_duration_spin.setSuffix("秒")
-        bilibili_form.addRow("Cookie:", self.bilibili_cookie_edit)
-        bilibili_form.addRow("最大下载时长:", self.max_duration_spin)
-        bilibili_group.setLayout(bilibili_form)
-        bilibili_layout.addWidget(bilibili_group)
-        
-        # Bilibili视频搜索按钮
-        bilibili_button_layout = QHBoxLayout()
-        self.bilibili_video_button = QPushButton("搜索B站视频")
-        self.bilibili_video_button.setStyleSheet("padding: 8px; background-color: rgba(219, 68, 83, 200); color: white; font-weight: bold;")
-        self.bilibili_video_button.clicked.connect(self.open_bilibili_video_search)
-        bilibili_button_layout.addWidget(self.bilibili_video_button)
-        bilibili_layout.addLayout(bilibili_button_layout)
-        bilibili_tab.setLayout(bilibili_layout)
-        
-        # 第四页：作者主页
-        author_tab = QWidget()
-        author_layout = QVBoxLayout()   
-        author_info = QLabel("欢迎使用Railgun_lover的音乐项目！")
-        author_info.setStyleSheet("font-size: 16px; font-weight: bold; margin: 10px;")
-        author_layout.addWidget(author_info, alignment=Qt.AlignCenter)
-
-        # 按钮布局
-        button_layout = QHBoxLayout()
-        bilibili_button = QPushButton("访问B站主页")
-        bilibili_button.setStyleSheet("""
-            QPushButton {
-                padding: 12px;
-                font-size: 14px;
-                background-color: #FB7299;
-                color: white;
-                border-radius: 6px;
-                min-width: 150px;
-            }
-            QPushButton:hover {
-                background-color: #FF85AD;
-            }
-        """)
-        bilibili_button.setCursor(QCursor(Qt.PointingHandCursor))
-        bilibili_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(
-            "https://space.bilibili.com/1411318075?spm_id_from=333.1007.0.0"
-        )))
-        
-        github_button = QPushButton("访问GitHub项目")
-        github_button.setStyleSheet("""
-            QPushButton {
-                padding: 12px;
-                font-size: 14px;
-                background-color: #6e5494;
-                color: white;
-                border-radius: 6px;
-                min-width: 150px;
-            }
-            QPushButton:hover {
-                background-color: #836EAA;
-            }
-        """)
-        github_button.setCursor(QCursor(Qt.PointingHandCursor))
-        github_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(
-            "https://github.com/MISAKAMIYO/Music_Player"
-        )))
-        
-        button_layout.addWidget(bilibili_button)
-        button_layout.addStretch()
-        button_layout.addWidget(github_button)
-        author_layout.addLayout(button_layout)
-    
-        # 分隔线
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setFrameShadow(QFrame.Sunken)
-        separator.setLineWidth(1)
-        author_layout.addWidget(separator)
-    
-        # 联系信息
-        contact_info = QLabel("项目开源免费，欢迎使用和交流！")
-        contact_info.setStyleSheet("font-size: 14px; color: #888888; margin-top: 15px;")
-        contact_info.setAlignment(Qt.AlignCenter)
-        author_layout.addWidget(contact_info)
-        author_tab.setLayout(author_layout)
-        
-        # 添加标签页
-        self.tabs.addTab(save_tab, "保存设置")
-        self.tabs.addTab(source_tab, "音源设置")
-        self.tabs.addTab(bilibili_tab, "Bilibili设置")
-        self.tabs.addTab(author_tab, "作者主页")
-        
-        # 按钮
-        button_layout = QHBoxLayout()
-        self.save_btn = QPushButton("保存")
-        self.save_btn.clicked.connect(self.save_settings)
-        self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.clicked.connect(self.reject)
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_btn)
-        button_layout.addWidget(self.cancel_btn)
-        layout.addWidget(self.tabs)
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-
-    def test_api_connection(self):
-        """测试当前音源API是否可用"""
-        config = get_active_source_config()
-        url = config["url"]
-        
-        # 对于公共音乐API，使用特殊的测试参数
-        if config["name"] == "公共音乐API":
-            test_url = "https://api.railgun.live/music/search?keyword=test&source=kugou&page=1&limit=1"
-            try:
-                response = requests.get(test_url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("code") == 200 and data.get("data"):
-                        QMessageBox.information(self, "测试成功", "公共音乐API连接正常！")
-                    else:
-                        QMessageBox.warning(self, "测试失败", f"API返回错误: {data.get('message', '未知错误')}")
-                else:
-                    QMessageBox.warning(self, "测试失败", f"API返回状态码: {response.status_code}")
-            except Exception as e:
-                QMessageBox.critical(self, "测试失败", f"无法连接到API: {str(e)}")
-        else:
-            # 其他音源的测试逻辑
-            try:
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    QMessageBox.information(self, "测试成功", f"API连接正常: {url}")
-                else:
-                    QMessageBox.warning(self, "测试失败", f"API返回状态码: {response.status_code}")
-            except Exception as e:
-                QMessageBox.critical(self, "测试失败", f"无法连接到API: {str(e)}")
-        
-    def add_music_source(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("添加新音源")
-        layout = QFormLayout()
-        
-        name_edit = QLineEdit()
-        url_edit = QLineEdit()
-        method_combo = QComboBox()
-        method_combo.addItems(["GET", "POST"])
-        
-        # 新增源类型选择
-        type_label = QLabel("源类型:")
-        type_combo = QComboBox()
-        type_combo.addItems(["标准API", "公共音乐API"])
-    
-        layout.addRow("名称:", name_edit)
-        layout.addRow("URL:", url_edit)
-        layout.addRow("请求方法:", method_combo)
-    
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-    
-        layout.addWidget(button_box)
-        dialog.setLayout(layout)
-    
-        if dialog.exec_() == QDialog.Accepted:
-            source_type = type_combo.currentText()
-            
-            # 根据不同源类型设置不同的默认参数
-            if source_type == "公共音乐API":
-                new_source = {
-                    "name": name_edit.text(),
-                    "url": "https://api.railgun.live/music/search",
-                    "params": {
-                        "keyword": "{query}",
-                        "source": "kugou",
-                        "page": 1,
-                        "limit": 20
-                    },
-                    "method": "GET",
-                    "headers": {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-                    }
-                }
-            else:
-                new_source = {
-                    "name": name_edit.text(),
-                    "url": url_edit.text(),
-                    "method": method_combo.currentText(),
-                    "params": {},
-                    "headers": {}
-                }
-                
-            self.settings["sources"]["sources_list"].append(new_source)
-            self.source_combo.addItem(new_source["name"])
-            # 立即设置为当前音源
-            self.settings["sources"]["active_source"] = new_source["name"]
-            self.source_combo.setCurrentText(new_source["name"])
-
-
-    def remove_music_source(self):
-        current_source = self.source_combo.currentText()
-        if current_source and current_source != "QQ音乐" and current_source != "网易云音乐" and current_source != "酷狗音乐":
-            reply = QMessageBox.question(
-                self, 
-                "确认删除",
-                f"确定要移除音源 '{current_source}' 吗？",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                # 从设置中移除
-                self.settings["sources"]["sources_list"] = [
-                    s for s in self.settings["sources"]["sources_list"]
-                    if s["name"] != current_source
-                ]
-                # 从下拉框中移除
-                self.source_combo.removeItem(self.source_combo.currentIndex())
-        
-    def refresh_dns_cache(self):
-        """刷新DNS缓存"""
-        try:
-            if sys.platform == "win32":
-                os.system("ipconfig /flushdns")
-            elif sys.platform == "darwin":
-                os.system("sudo killall -HUP mDNSResponder")
-            else:
-                # Linux使用不同的命令
-                if os.path.exists("/etc/init.d/nscd"):
-                    os.system("sudo /etc/init.d/nscd restart")
-                elif os.path.exists("/usr/bin/systemd-resolve"):
-                    os.system("sudo systemd-resolve --flush-caches")
-                else:
-                    os.system("sudo systemctl restart systemd-resolved.service")
-            QMessageBox.information(self, "成功", "DNS缓存已刷新")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"刷新DNS缓存失败: {str(e)}")
-    
-
-    def open_bilibili_video_search(self):
-        cookie = self.bilibili_cookie_edit.text().strip()
-        dialog = VideoSearchDialog(self, cookie)
-        dialog.exec_()
-        
-    def create_dir_row(self, edit, btn):
-        row_layout = QHBoxLayout()
-        row_layout.addWidget(edit)
-        row_layout.addWidget(btn)
-        widget = QWidget()
-        widget.setLayout(row_layout)
-        return widget
-        
-    def select_directory(self, edit):
-        directory = QFileDialog.getExistingDirectory(self, "选择目录")
-        if directory:
-            edit.setText(directory)
-            
-    def select_image(self, edit):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择背景图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)"
-        )
-        if file_path:
-            edit.setText(file_path)
-
-    def preview_background(self):
-        image_path = self.bg_image_edit.text()
-        if image_path and os.path.exists(image_path):
-            preview_dialog = QDialog(self)
-            preview_dialog.setWindowTitle("背景预览")
-            preview_dialog.setGeometry(300, 300, 600, 400)
-            layout = QVBoxLayout()
-            image_label = QLabel()
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                pixmap = pixmap.scaled(550, 350, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                image_label.setPixmap(pixmap)
-                image_label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(image_label)
-            preview_dialog.setLayout(layout)
-            preview_dialog.exec_()
-        else:
-            QMessageBox.warning(self, "错误", "图片路径无效或文件不存在")
-            
-    def load_settings(self):
-        self.music_dir_edit.setText(self.settings["save_paths"]["music"])
-        self.cache_dir_edit.setText(self.settings["save_paths"]["cache"])
-        self.video_dir_edit.setText(self.settings["save_paths"].get("videos", os.path.join(os.path.expanduser("~"), "Videos")))
-        self.bg_image_edit.setText(self.settings.get("background_image", ""))
-        self.max_results_spin.setValue(self.settings["other"]["max_results"])
-        self.auto_play_check.setChecked(self.settings["other"]["auto_play"])
-        self.source_combo.setCurrentText(self.settings["sources"]["active_source"])
-        active_source = get_active_source_config()
-        self.api_key_edit.setText(active_source.get("api_key", ""))
-        self.bilibili_cookie_edit.setText(self.settings["bilibili"].get("cookie", ""))
-        self.max_duration_spin.setValue(self.settings["bilibili"].get("max_duration", 600))
-        self.phone_ip_edit.setText(QSettings.get("phone_ip", ""))
-
-    def save_settings(self):
-        self.settings["save_paths"]["music"] = self.music_dir_edit.text()
-        self.settings["save_paths"]["cache"] = self.cache_dir_edit.text()
-        self.settings["save_paths"]["videos"] = self.video_dir_edit.text()
-        self.settings["background_image"] = self.bg_image_edit.text()
-        self.settings["other"]["max_results"] = self.max_results_spin.value()
-        self.settings["other"]["auto_play"] = self.auto_play_check.isChecked()
-        active_source = self.source_combo.currentText()
-        self.settings["sources"]["active_source"] = active_source
-        QSettings["phone_ip"] = self.phone_ip_edit.text()
-        
-        # 更新API密钥
-        for source in self.settings["sources"]["sources_list"]:
-            if source["name"] == active_source:
-                source["api_key"] = self.api_key_edit.text()
-                break
-        
-        # 更新Bilibili设置
-        if "bilibili" not in self.settings:
-            self.settings["bilibili"] = {}
-        self.settings["bilibili"]["cookie"] = self.bilibili_cookie_edit.text()
-        self.settings["bilibili"]["max_duration"] = self.max_duration_spin.value()
-        
-        if save_settings(self.settings):
-            if self.parent:
-               self.parent.refresh_source_combo()
-            self.lyrics_settings_updated.emit()
-            self.accept()
-        else:
-            QMessageBox.warning(self, "错误", "保存设置失败，请检查日志")
-        
-        # 保存设置
-        if save_settings(self.settings):
-            if self.parent:
-               self.parent.refresh_source_combo()
-            self.lyrics_settings_updated.emit()
-            self.accept()
-        else:
-            QMessageBox.warning(self, "错误", "保存设置失败，请检查日志")
 
 # =============== 工具对话框 ===============
 class ToolsDialog(QDialog):
@@ -5352,7 +5900,30 @@ class SwitchDeviceEvent(QEvent):
     def __init__(self, device):
         super().__init__(SwitchDeviceEvent.event_type)
         self.device = device
+
+class ProgressManager(QObject):
+    """统一的进度管理器"""
+    progress_updated = pyqtSignal(int, int)  # 当前位置, 总时长
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_position = 0
+        self.total_duration = 0
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(100)  # 100ms更新间隔
+        self.update_timer.timeout.connect(self.emit_progress)
+        self.update_timer.start()
         
+    def set_position(self, position):
+        self.current_position = position
+        
+    def set_duration(self, duration):
+        self.total_duration = duration
+        
+    def emit_progress(self):
+        if self.total_duration > 0:
+            self.progress_updated.emit(self.current_position, self.total_duration)
+
 # =============== 主应用程序 ===============
 class MusicPlayerApp(QMainWindow):
     def __init__(self):
@@ -5369,11 +5940,6 @@ class MusicPlayerApp(QMainWindow):
             self.log_console = None
             self.active_threads = []
             self.tools_menu = None 
-            # 设备切换
-            self.current_device = "computer"  # 默认电脑播放
-            self.phone_player = None  # 手机播放器
-            self.last_play_position = 0  # 最后播放位置
-            self.was_playing = False  # 切换前是否正在播放
             # 初始化用户系统
             self.user_manager = UserManager()
             self.current_user_id = None
@@ -5381,13 +5947,19 @@ class MusicPlayerApp(QMainWindow):
             # 初始化设备同步系统
             self.sync_server = SyncServer()
             self.sync_client = SyncClient()
-        
+            self.float_window = None
             # 初始化视频播放器
             self.video_player = VideoPlayer()
-        
+            self.is_maximized = False 
             # 初始化频谱可视化
             self.spectrum_widget = SpectrumWidget()
-        
+            # 创建统一的进度管理器
+            self.progress_manager = ProgressManager(self)
+            self.progress_manager.progress_updated.connect(self.update_all_progress_bars)
+            self.main_layout = None
+            # 连接媒体播放器信号
+            self.media_player.positionChanged.connect(self.progress_manager.set_position)
+            self.media_player.durationChanged.connect(self.progress_manager.set_duration)
             # 初始化速度控制
             self.speed_control = SpeedControl(self.media_player)
         
@@ -5412,8 +5984,6 @@ class MusicPlayerApp(QMainWindow):
             self.setup_netease_connections()  # 连接网易云信号
             self.init_ui()
             self.setup_connections()
-            # 加载设备设置
-            self.load_device_setting()
             self.media_player.mediaStatusChanged.connect(self.handle_media_status_changed)
             logger.info("应用程序启动")
             self.playlist_file = "playlists.json"
@@ -5576,6 +6146,16 @@ class MusicPlayerApp(QMainWindow):
             self.stop_music_room_server()
         else:
             self.start_music_room_server()
+    
+    def open_snake_game(self):
+        """打开贪吃蛇游戏"""
+        game = SnakeGame(self)
+        game.exec_()
+    
+    def open_chess_game(self):
+        """打开国际象棋游戏"""
+        game = ChessGame(self)
+        game.exec_()
 
     def start_music_room_server(self):
         """启动音乐室服务器"""
@@ -5736,6 +6316,35 @@ class MusicPlayerApp(QMainWindow):
     
         # 设置歌词同步状态
         self.lyrics_sync.enabled = show_lyrics
+    
+    def update_all_progress_bars(self, position, duration):
+        """统一更新所有进度显示"""
+        try:
+            # 更新主窗口进度条
+            if duration > 0:
+                progress = int(1000 * position / duration)
+                self.progress_slider.blockSignals(True)
+                self.progress_slider.setValue(progress)
+                self.progress_slider.blockSignals(False)
+                
+                # 更新时间显示
+                self.current_time_label.setText(self.format_time(position))
+                self.total_time_label.setText(self.format_time(duration))
+            
+            # 更新悬浮窗进度条
+            if hasattr(self, 'float_window') and self.float_window:
+                # 检查方法签名
+                import inspect
+                sig = inspect.signature(self.float_window.update_progress)
+                if len(sig.parameters) == 2:  # 包括self
+                    self.float_window.update_progress(position, duration)
+                else:
+                    # 回退到单参数调用
+                    if duration > 0:
+                        progress = int(1000 * position / duration)
+                        self.float_window.update_progress(progress)
+        except Exception as e:
+            logger.error(f"更新进度条时出错: {str(e)}")
 
     def update_lyrics_style(self):
         """更新歌词窗口样式"""
@@ -6106,11 +6715,830 @@ class MusicPlayerApp(QMainWindow):
     def apply_initial_style_sheet(self):
         """应用初始样式表"""
         self.setStyleSheet(self.initial_style_sheet)
+
+    def init_settings_panel(self):
+        """初始化嵌入式设置面板 - 修复版本"""
+        # 清除现有布局
+        if hasattr(self, 'settings_panel_layout'):
+            # 安全地清除现有布局
+            QWidget().setLayout(self.settings_panel.layout())
+        else:
+            self.settings_panel_layout = QVBoxLayout(self.settings_panel)
+        
+        # 确保设置面板有最小尺寸
+        self.settings_panel.setMinimumSize(600, 400)
+        
+        # 创建标签页
+        self.settings_tabs = QTabWidget()
+        
+        # 第一页：保存设置
+        save_tab = self.create_save_settings_tab()
+        self.settings_tabs.addTab(save_tab, "保存设置")
+        
+        # 第二页：音源设置
+        source_tab = self.create_source_settings_tab()
+        self.settings_tabs.addTab(source_tab, "音源设置")
+        
+        # 第三页：Bilibili设置
+        bilibili_tab = self.create_bilibili_settings_tab()
+        self.settings_tabs.addTab(bilibili_tab, "Bilibili设置")
+        
+        # 添加标签页到布局
+        self.settings_panel_layout.addWidget(self.settings_tabs)
+        
+        # 添加保存按钮
+        button_layout = QHBoxLayout()
+        self.save_settings_btn = QPushButton("保存设置")
+        self.save_settings_btn.setIcon(QIcon.fromTheme("document-save"))
+        self.save_settings_btn.clicked.connect(self.save_settings_from_panel)
+        button_layout.addWidget(self.save_settings_btn, alignment=Qt.AlignRight)
+        
+        self.settings_panel_layout.addLayout(button_layout)
+        
+        # 应用特定的设置面板样式
+        self.settings_panel.setStyleSheet("""
+            QWidget {
+                background-color: #252526;
+                color: #ffffff;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            }
+        
+            QTabWidget::pane {
+                border: 1px solid #3f3f46;
+                background: #252526;
+                margin: 0;
+            }
+        
+            QTabBar::tab {
+                background: #252526;
+                color: #a0a0a0;
+                padding: 8px 16px;
+                border: 1px solid #3f3f46;
+                border-bottom: none;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+            }
+          
+            QTabBar::tab:selected, QTabBar::tab:hover {
+                background: #2d2d30;
+                color: #ffffff;
+                border-color: #3f3f46;
+            }
+        
+            QGroupBox {
+                background-color: #2d2d30;
+                border: 1px solid #3f3f46;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding: 10px;
+            }
+        
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                padding: 0 8px;
+                background-color: #2d2d30;
+                color: #ffffff;
+            }
+        
+            QLabel {
+                color: #ffffff;
+            }
+        
+            QLineEdit, QTextEdit, QComboBox, QSpinBox, QCheckBox {
+                background-color: #3c3c3c;
+                color: #e0e0e0;
+                border: 1px solid #5a5a5a;
+                border-radius: 3px;
+                padding: 5px;
+            }
+        
+            QPushButton {
+                background-color: #3a5a98;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 12px;
+                min-height: 30px;
+            }
+            
+            QPushButton:hover {
+                background-color: #4a6aa8;
+            }
+        
+            QPushButton:pressed {
+                background-color: #2a4a88;
+            }
+        """)
+        # 加载设置到面板
+        self.load_settings_to_panel()
     
+    def create_save_settings_tab(self):
+        """创建保存设置标签页"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+    
+        # 保存位置设置
+        save_group = QGroupBox("保存位置设置")
+        save_layout = QVBoxLayout(save_group)
+    
+        # 音乐保存位置
+        music_layout = QHBoxLayout()
+        self.music_dir_edit = QLineEdit()
+        self.music_dir_btn = QPushButton("浏览...")
+        self.music_dir_btn.clicked.connect(lambda: self.select_directory(self.music_dir_edit))
+        music_layout.addWidget(self.music_dir_edit)
+        music_layout.addWidget(self.music_dir_btn)
+        save_layout.addWidget(QLabel("音乐保存位置:"))
+        save_layout.addLayout(music_layout)
+    
+        # 缓存文件位置
+        cache_layout = QHBoxLayout()
+        self.cache_dir_edit = QLineEdit()
+        self.cache_dir_btn = QPushButton("浏览...")
+        self.cache_dir_btn.clicked.connect(lambda: self.select_directory(self.cache_dir_edit))
+        cache_layout.addWidget(self.cache_dir_edit)
+        cache_layout.addWidget(self.cache_dir_btn)
+        save_layout.addWidget(QLabel("缓存文件位置:"))
+        save_layout.addLayout(cache_layout)
+    
+        # 视频保存位置
+        video_layout = QHBoxLayout()
+        self.video_dir_edit = QLineEdit()
+        self.video_dir_btn = QPushButton("浏览...")
+        self.video_dir_btn.clicked.connect(lambda: self.select_directory(self.video_dir_edit))
+        video_layout.addWidget(self.video_dir_edit)
+        video_layout.addWidget(self.video_dir_btn)
+        save_layout.addWidget(QLabel("视频保存位置:"))
+        save_layout.addLayout(video_layout)
+    
+        layout.addWidget(save_group)
+    
+        # 背景设置
+        bg_group = QGroupBox("背景设置")
+        bg_layout = QVBoxLayout(bg_group)
+    
+        bg_layout.addWidget(QLabel("背景图片路径:"))
+        bg_path_layout = QHBoxLayout()
+        self.bg_image_edit = QLineEdit()
+        self.bg_image_btn = QPushButton("浏览...")
+        self.bg_image_btn.clicked.connect(lambda: self.select_image(self.bg_image_edit))
+        bg_path_layout.addWidget(self.bg_image_edit)
+        bg_path_layout.addWidget(self.bg_image_btn)
+        bg_layout.addLayout(bg_path_layout)
+    
+        self.bg_preview_btn = QPushButton("预览背景")
+        self.bg_preview_btn.clicked.connect(self.preview_background)
+        bg_layout.addWidget(self.bg_preview_btn)
+    
+        layout.addWidget(bg_group)
+    
+        # 其他设置
+        other_group = QGroupBox("其他设置")
+        other_layout = QVBoxLayout(other_group)
+    
+        self.max_results_spin = QSpinBox()
+        self.max_results_spin.setRange(5, 100)
+        other_layout.addWidget(QLabel("最大获取数量:"))
+        other_layout.addWidget(self.max_results_spin)
+    
+        self.auto_play_check = QCheckBox("下载后自动播放")
+        other_layout.addWidget(self.auto_play_check)
+    
+        self.show_translation_check = QCheckBox("显示歌词翻译")
+        other_layout.addWidget(self.show_translation_check)
+    
+        layout.addWidget(other_group)
+    
+        layout.addStretch()
+        return tab
+
+    def create_source_settings_tab(self):
+        """创建音源设置标签页"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+    
+        # 音源选择
+        source_group = QGroupBox("音源设置")
+        source_layout = QVBoxLayout(source_group)
+       
+        source_layout.addWidget(QLabel("选择音源:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(get_source_names())
+        source_layout.addWidget(self.source_combo)
+    
+        source_layout.addWidget(QLabel("API密钥:"))
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText("如需API密钥请在此输入")
+        source_layout.addWidget(self.api_key_edit)
+    
+        layout.addWidget(source_group)
+    
+        # 测试按钮
+        test_button = QPushButton("测试连接")
+        test_button.clicked.connect(self.test_api_connection)
+        layout.addWidget(test_button)
+    
+        # DNS刷新按钮
+        dns_button = QPushButton("刷新DNS缓存")
+        dns_button.clicked.connect(self.refresh_dns_cache)
+        layout.addWidget(dns_button)
+    
+        layout.addStretch()
+        return tab
+
+    def create_bilibili_settings_tab(self):
+        """创建Bilibili设置标签页"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+    
+        # Bilibili设置
+        bilibili_group = QGroupBox("Bilibili设置")
+        bilibili_layout = QVBoxLayout(bilibili_group)
+    
+        bilibili_layout.addWidget(QLabel("Cookie:"))
+        self.bilibili_cookie_edit = QLineEdit()
+        self.bilibili_cookie_edit.setPlaceholderText("输入Bilibili Cookie（可选）")
+        bilibili_layout.addWidget(self.bilibili_cookie_edit)
+    
+        bilibili_layout.addWidget(QLabel("最大下载时长:"))
+        self.max_duration_spin = QSpinBox()
+        self.max_duration_spin.setRange(60, 3600)
+        self.max_duration_spin.setSuffix("秒")
+        bilibili_layout.addWidget(self.max_duration_spin)
+    
+        layout.addWidget(bilibili_group)
+    
+        # Bilibili视频搜索按钮
+        self.bilibili_video_button = QPushButton("搜索B站视频")
+        self.bilibili_video_button.setStyleSheet("padding: 8px; background-color: rgba(219, 68, 83, 200); color: white; font-weight: bold;")
+        self.bilibili_video_button.clicked.connect(self.open_bilibili_video_search)
+        layout.addWidget(self.bilibili_video_button)
+    
+        layout.addStretch()
+        return tab
+
+    def save_settings_from_panel(self):
+        """从嵌入式面板保存设置"""
+        try:
+            # 保存设置到QSettings
+            settings = QSettings("Railgun_lover", "MusicPlayer")
+        
+            # 保存位置设置
+            self.settings["save_paths"]["music"] = self.music_dir_edit.text()
+            self.settings["save_paths"]["cache"] = self.cache_dir_edit.text()
+            self.settings["save_paths"]["videos"] = self.video_dir_edit.text()
+        
+            # 背景设置
+            self.settings["background_image"] = self.bg_image_edit.text()
+        
+            # 其他设置
+            self.settings["other"]["max_results"] = self.max_results_spin.value()
+            self.settings["other"]["auto_play"] = self.auto_play_check.isChecked()
+            self.settings["other"]["show_translation"] = self.show_translation_check.isChecked()
+        
+            # 音源设置
+            active_source = self.source_combo.currentText()
+            self.settings["sources"]["active_source"] = active_source
+                
+            # 更新API密钥
+            for source in self.settings["sources"]["sources_list"]:
+                if source["name"] == active_source:
+                    source["api_key"] = self.api_key_edit.text()
+                    break
+        
+            # Bilibili设置
+            self.settings["bilibili"]["cookie"] = self.bilibili_cookie_edit.text()
+            self.settings["bilibili"]["max_duration"] = self.max_duration_spin.value()
+        
+            # 保存设置到文件
+            save_settings(self.settings)
+        
+            # 刷新UI
+            self.refresh_source_combo()
+            self.set_background()
+            self.update_lyrics_visibility()
+        
+            # 显示成功消息
+            self.status_bar.showMessage("设置已保存！", 5000)
+            logger.info("设置已保存")
+        
+        except Exception as e:
+            logger.error(f"保存设置失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"保存设置失败: {str(e)}")
+    
+    # =============== 加载设置到面板 ===============
+    def load_settings_to_panel(self):
+        """加载设置到嵌入式面板"""
+        # 创建QSettings实例
+        settings = QSettings("Railgun_lover", "MusicPlayer")
+        # 从QSettings中读取手机IP
+        phone_ip = settings.value("phone_ip", "")
+    
+        # 保存位置
+        self.music_dir_edit.setText(self.settings["save_paths"]["music"])
+        self.cache_dir_edit.setText(self.settings["save_paths"]["cache"])
+        self.video_dir_edit.setText(self.settings["save_paths"].get("videos", os.path.join(os.path.expanduser("~"), "Videos")))
+        self.bg_image_edit.setText(self.settings.get("background_image", ""))
+    
+        # 其他设置
+        self.max_results_spin.setValue(self.settings["other"]["max_results"])
+        self.auto_play_check.setChecked(self.settings["other"]["auto_play"])
+        self.show_translation_check.setChecked(self.settings["other"].get("show_translation", True))
+    
+        # 音源设置
+        active_source = self.settings["sources"]["active_source"]
+        self.source_combo.setCurrentText(active_source)
+    
+        # 更新API密钥
+        active_source_config = get_active_source_config()
+        self.api_key_edit.setText(active_source_config.get("api_key", ""))
+    
+        # Bilibili设置
+        self.bilibili_cookie_edit.setText(self.settings["bilibili"].get("cookie", ""))
+        self.max_duration_spin.setValue(self.settings["bilibili"].get("max_duration", 600))
+
+
+    # =============== 辅助函数 ===============
+    def create_dir_row(self, edit, btn):
+        row_layout = QHBoxLayout()
+        row_layout.addWidget(edit)
+        row_layout.addWidget(btn)
+        widget = QWidget()
+        widget.setLayout(row_layout)
+        return widget
+
+    def select_directory(self, edit):
+        directory = QFileDialog.getExistingDirectory(self, "选择目录")
+        if directory:
+            edit.setText(directory)
+
+    def select_image(self, edit):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择背景图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)"
+        )
+        if file_path:
+            edit.setText(file_path)
+
+    def preview_background(self):
+        image_path = self.bg_image_edit.text()
+        if image_path and os.path.exists(image_path):
+            preview_dialog = QDialog(self)
+            preview_dialog.setWindowTitle("背景预览")
+            preview_dialog.setGeometry(300, 300, 600, 400)
+            layout = QVBoxLayout()
+            image_label = QLabel()
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(550, 350, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                image_label.setPixmap(pixmap)
+                image_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(image_label)
+            preview_dialog.setLayout(layout)
+            preview_dialog.exec_()
+        else:
+            QMessageBox.warning(self, "错误", "图片路径无效或文件不存在")
+        
+    def test_api_connection(self):
+        """测试当前音源API是否可用"""
+        config = get_active_source_config()
+        url = config["url"]
+      
+        # 对于公共音乐API，使用特殊的测试参数
+        if config["name"] == "公共音乐API":
+            test_url = "https://api.railgun.live/music/search?keyword=test&source=kugou&page=1&limit=1"
+            try:
+                response = requests.get(test_url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("code") == 200 and data.get("data"):
+                        QMessageBox.information(self, "测试成功", "公共音乐API连接正常！")
+                    else:
+                        QMessageBox.warning(self, "测试失败", f"API返回错误: {data.get('message', '未知错误')}")
+                else:
+                    QMessageBox.warning(self, "测试失败", f"API返回状态码: {response.status_code}")
+            except Exception as e:
+                QMessageBox.critical(self, "测试失败", f"无法连接到API: {str(e)}")
+        else:
+            # 其他音源的测试逻辑
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    QMessageBox.information(self, "测试成功", f"API连接正常: {url}")
+                else:
+                    QMessageBox.warning(self, "测试失败", f"API返回状态码: {response.status_code}")
+            except Exception as e:
+                QMessageBox.critical(self, "测试失败", f"无法连接到API: {str(e)}")
+        
+    def add_music_source(self):
+        """添加新音源"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("添加新音源")
+        layout = QFormLayout()
+    
+        name_edit = QLineEdit()
+        url_edit = QLineEdit()
+        method_combo = QComboBox()
+        method_combo.addItems(["GET", "POST"])
+    
+        # 新增源类型选择
+        type_label = QLabel("源类型:")
+        type_combo = QComboBox()
+        type_combo.addItems(["标准API", "公共音乐API"])
+
+        layout.addRow("名称:", name_edit)
+        layout.addRow("URL:", url_edit)
+        layout.addRow("请求方法:", method_combo)
+        layout.addRow(type_label, type_combo)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        layout.addWidget(button_box)
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            source_type = type_combo.currentText()
+        
+            # 根据不同源类型设置不同的默认参数
+            if source_type == "公共音乐API":
+                new_source = {
+                    "name": name_edit.text(),
+                    "url": "https://api.railgun.live/music/search",
+                    "params": {
+                        "keyword": "{query}",
+                        "source": "kugou",
+                        "page": 1,
+                        "limit": 20
+                    },
+                    "method": "GET",
+                    "headers": {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+                    }
+                }
+            else:
+                new_source = {
+                    "name": name_edit.text(),
+                    "url": url_edit.text(),
+                    "method": method_combo.currentText(),
+                    "params": {},
+                    "headers": {}
+                }
+                    
+            self.settings["sources"]["sources_list"].append(new_source)
+            self.source_combo.addItem(new_source["name"])
+            # 立即设置为当前音源
+            self.settings["sources"]["active_source"] = new_source["name"]
+            self.source_combo.setCurrentText(new_source["name"])
+            save_settings(self.settings)
+            self.refresh_source_combo()
+
+    def remove_music_source(self):
+        """移除音源"""
+        current_source = self.source_combo.currentText()
+        if current_source and current_source != "QQ音乐" and current_source != "网易云音乐" and current_source != "酷狗音乐":
+            reply = QMessageBox.question(
+                self, 
+                "确认删除",
+                f"确定要移除音源 '{current_source}' 吗？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                # 从设置中移除
+                self.settings["sources"]["sources_list"] = [
+                    s for s in self.settings["sources"]["sources_list"]
+                    if s["name"] != current_source
+                ]
+                # 从下拉框中移除
+                self.source_combo.removeItem(self.source_combo.currentIndex())
+                save_settings(self.settings)
+                self.refresh_source_combo()
+
+    def refresh_dns_cache(self):
+        """刷新DNS缓存"""
+        try:
+            if sys.platform == "win32":
+                os.system("ipconfig /flushdns")
+            elif sys.platform == "darwin":
+                os.system("sudo killall -HUP mDNSResponder")
+            else:
+                # Linux使用不同的命令
+                if os.path.exists("/etc/init.d/nscd"):
+                    os.system("sudo /etc/init.d/nscd restart")
+                elif os.path.exists("/usr/bin/systemd-resolve"):
+                    os.system("sudo systemd-resolve --flush-caches")
+                else:
+                    os.system("sudo systemctl restart systemd-resolved.service")
+            QMessageBox.information(self, "成功", "DNS缓存已刷新")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"刷新DNS缓存失败: {str(e)}")
+
+    def open_bilibili_video_search(self):
+        cookie = self.bilibili_cookie_edit.text().strip()
+        dialog = VideoSearchDialog(self, cookie)
+        dialog.exec_()
+    
+    def refresh_room_list(self):
+        """刷新房间列表"""
+        if self.room_manager.connected:
+            message = {
+                "type": "request_room_list"
+            }
+            self.room_manager.send_message(json.dumps(message))
+
+    def create_room(self):
+        """创建新房间"""
+        room_name, ok = QInputDialog.getText(
+            self, "创建房间", "输入房间名称:"
+        )
+        if ok and room_name:
+            if self.room_manager.create_room(room_name):
+                QMessageBox.information(self, "成功", f"房间 '{room_name}' 已创建")
+            else:
+                QMessageBox.warning(self, "错误", "创建房间失败")
+
+    def join_selected_room(self):
+        """加入选中的房间"""
+        selected_item = self.room_list.currentItem()
+        if not selected_item:
+            return
+        
+        room_id = selected_item.data(Qt.UserRole)
+        if self.room_manager.join_room(room_id):
+            self.current_room = next(
+                (r for r in self.room_manager.room_list if r["id"] == room_id), 
+                None
+            )
+            if self.current_room:
+                self.room_name_label.setText(f"房间: {self.current_room['name']}")
+                self.leave_btn.setEnabled(True)
+                # 更新用户列表
+                self.user_list.clear()
+                for user in self.current_room["users"]:
+                    self.user_list.addItem(user)
+
+    def leave_room(self):
+        """离开当前房间"""
+        if self.room_manager.leave_room():
+            self.current_room = None
+            self.room_name_label.setText("未加入房间")
+            self.leave_btn.setEnabled(False)
+            self.user_list.clear()
+
+    def send_chat(self):
+        """发送聊天消息"""
+        message = self.chat_input.text().strip()
+        if not message:
+            return
+        
+        if self.room_manager.send_chat_message(message):
+            self.chat_input.clear()
+
+    def send_play_command(self, command):
+        """发送播放控制命令"""
+        if not self.current_room:
+            return
+        
+        # 如果是加载歌曲命令，需要特殊处理
+        if command == "load_song":
+            file_path = self.parent.current_song_path
+            if not file_path:
+                return
+            self.room_manager.send_playback_command("load_song", song_path=file_path)
+        else:
+            self.room_manager.send_playback_command(command)
+
+    def send_volume(self, value):
+        """发送音量控制命令"""
+        if not self.current_room:
+            return
+        
+        self.room_manager.send_playback_command("volume", volume=value)
+
+    def reset_position(self):
+        """重置歌词窗口位置到屏幕底部中央"""
+        screen_geometry = QApplication.primaryScreen().availableGeometry()
+        self.setGeometry(
+            (screen_geometry.width() - 1400) // 2,
+            screen_geometry.height() - 200,
+            1400,
+            200
+        )
+        self.save_lyrics_settings()
+
+    def create_dir_row(self, edit, btn):
+        """创建目录选择行"""
+        row_layout = QHBoxLayout()
+        row_layout.addWidget(edit)
+        row_layout.addWidget(btn)
+        widget = QWidget()
+        widget.setLayout(row_layout)
+        return widget
+
+    def select_directory(self, edit):
+        """选择目录"""
+        directory = QFileDialog.getExistingDirectory(self, "选择目录")
+        if directory:
+            edit.setText(directory)
+
+    def select_image(self, edit):
+        """选择图片文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择背景图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)"
+        )
+        if file_path:
+            edit.setText(file_path)
+
+    def preview_background(self):
+        """预览背景图片"""
+        image_path = self.bg_image_edit.text()
+        if image_path and os.path.exists(image_path):
+            preview_dialog = QDialog(self)
+            preview_dialog.setWindowTitle("背景预览")
+            preview_dialog.setGeometry(300, 300, 600, 400)
+            layout = QVBoxLayout()
+            image_label = QLabel()
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(550, 350, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                image_label.setPixmap(pixmap)
+                image_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(image_label)
+            preview_dialog.setLayout(layout)
+            preview_dialog.exec_()
+        else:
+            QMessageBox.warning(self, "错误", "图片路径无效或文件不存在")
+
+    def refresh_source_combo(self):
+        """刷新音源选择下拉框"""
+        self.source_combo.clear()
+        self.source_combo.addItems(get_source_names())
+        self.source_combo.setCurrentText(self.settings["sources"]["active_source"])
+
+    def get_source_names(self):
+        """获取所有音源名称"""
+        return [source["name"] for source in self.settings["sources"]["sources_list"]]
+
+    def get_active_source_config(self):
+        """获取当前激活的音源配置"""
+        active_source = self.settings["sources"]["active_source"]
+        for source in self.settings["sources"]["sources_list"]:
+            if source["name"] == active_source:
+                return source
+        return self.settings["sources"]["sources_list"][0]
+
+    def save_lyrics_settings(self):
+        """保存歌词窗口设置"""
+        settings = load_settings()
+        lyrics_settings = settings.get("external_lyrics", {})
+    
+        # 保存几何信息
+        lyrics_settings["geometry"] = self.saveGeometry().toHex().data().decode()
+    
+        # 保存字体信息（使用当前行标签的字体）
+        lyrics_settings["font"] = self.current_time_label.font().toString()
+    
+        # 保存颜色信息（这里保存的是当前行标签的颜色）
+        lyrics_settings["color"] = self.current_time_label.palette().color(QPalette.WindowText).name()
+    
+        # 保存透明度
+        lyrics_settings["opacity"] = int(self.windowOpacity() * 100)
+    
+        # 保存显示状态
+        lyrics_settings["show_lyrics"] = self.isVisible()
+
+        settings["external_lyrics"] = lyrics_settings
+        save_settings(settings)
+
+    def set_background(self):
+        """设置背景图片，但保留内部组件的半透明效果"""
+        bg_image = self.settings.get("background_image", "")
+        if bg_image and os.path.exists(bg_image):
+            # 只设置主窗口背景，不影响内部组件
+            self.setStyleSheet(f"""
+                QMainWindow {{
+                    background-image: url({bg_image});
+                    background-position: center;
+                    background-repeat: no-repeat;
+                    background-attachment: fixed;
+                }}
+        
+                /* 重新应用内部组件的半透明样式 */
+                QListWidget#resultsList {{
+                    background-color: rgba(45, 45, 48, 150);
+                    color: #e0e0e0;
+                    border: 1px solid rgba(63, 63, 70, 100);
+                    border-radius: 4px;
+                    alternate-background-color: rgba(55, 55, 58, 150);
+                }}
+        
+                QTextEdit#songInfo {{
+                    background-color: rgba(45, 45, 48, 150);
+                    color: #e0e0e0;
+                    border: 1px solid rgba(63, 63, 70, 100);
+                    border-radius: 4px;
+                }}
+        
+                QListWidget#playlistWidget {{
+                    background-color: rgba(45, 45, 48, 150);
+                    color: #e0e0e0;
+                    border: 1px solid rgba(63, 63, 70, 100);
+                    border-radius: 4px;
+                    alternate-background-color: rgba(55, 55, 58, 150);
+                }}
+            """)
+        else:
+            # 如果没有背景图片，则恢复初始样式
+            self.apply_initial_style_sheet()
+
+    def apply_initial_style_sheet(self):
+        """应用初始样式表"""
+        self.setStyleSheet(self.initial_style_sheet)
+
+    def update_lyrics_visibility(self):
+        """根据设置更新歌词窗口的显示状态"""
+        settings = load_settings()
+        lyrics_settings = settings.get("lyrics", {})
+        show_lyrics = lyrics_settings.get("show_lyrics", True)
+    
+        if show_lyrics:
+            self.external_lyrics.show()
+        else:
+            self.external_lyrics.hide()
+    
+        # 设置歌词同步状态
+        self.lyrics_sync.enabled = show_lyrics
+
+    def update_lyrics_style(self):
+        """更新歌词窗口样式"""
+        logger.info("更新歌词窗口样式")
+        try:
+            # 获取最新设置
+            settings = load_settings()
+            lyrics_settings = settings.get("external_lyrics", {})
+        
+            # 应用字体
+            font_str = lyrics_settings.get("font", "Microsoft YaHei,36")
+            font = QFont()
+            font.fromString(font_str)
+            self.external_lyrics.set_font(font)
+        
+            # 应用颜色
+            normal_color = QColor(lyrics_settings.get("normal_color", "#FFFFFF"))
+            highlight_color = QColor(lyrics_settings.get("highlight_color", "#000000"))
+            next_line_color = QColor(lyrics_settings.get("next_line_color", "#AAAAAA"))
+            self.external_lyrics.set_colors(normal_color, highlight_color, next_line_color)
+        
+            # 应用透明度
+            opacity = lyrics_settings.get("opacity", 80) / 100.0
+            self.external_lyrics.setWindowOpacity(opacity)
+        
+            # 应用效果
+            effect_type = lyrics_settings.get("effect_type", "fill")
+            outline_size = lyrics_settings.get("outline_size", 2)
+            glow_size = lyrics_settings.get("glow_size", 10)
+            self.external_lyrics.set_effect(effect_type, outline_size, glow_size)
+        
+            # 应用位置
+            geometry_hex = lyrics_settings.get("geometry", "")
+            if geometry_hex:
+                byte_array = QByteArray.fromHex(geometry_hex.encode())
+                self.external_lyrics.restoreGeometry(byte_array)
+        
+            # 应用锁定状态
+            locked = lyrics_settings.get("locked", False)
+            self.external_lyrics.set_locked(locked)
+        
+            # 强制重绘
+            self.external_lyrics.repaint()
+            logger.info("歌词窗口样式更新完成")
+        
+        except Exception as e:
+            logger.error(f"更新歌词样式失败: {str(e)}")
+    
+
     def init_ui(self):
         # 创建主布局
-        self.setWindowTitle("音乐捕捉器 create bilibili by:Railgun_lover")
-        self.setGeometry(100, 100, 1280, 900)
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 初始化主布局为实例属性
+        self.main_layout = QVBoxLayout(central_widget)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)  
+        self.main_layout.setSpacing(0)
+        
+        # 先初始化标题栏
+        self.init_title_bar()
+        
+        # 然后创建主内容区域
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(15, 15, 15, 15)
+        content_layout.setSpacing(15)
     
         # 设置应用样式
         self.setStyleSheet("""
@@ -6118,6 +7546,8 @@ class MusicPlayerApp(QMainWindow):
                 background-color: #1e1e1e;
                 color: #d4d4d4;
                 font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+                border: 1px solid #3f3f46;
+                border-radius: 4px;
             }
             QListWidget#resultsList {
                 background-color: rgba(45, 45, 48, 150);  /* 添加透明度 */
@@ -6279,16 +7709,38 @@ class MusicPlayerApp(QMainWindow):
             }
         """)
         
-        # 创建中央部件
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(15)
+        self.main_layout.addWidget(content_widget)
+
+        # 创建标签页控件
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabPosition(QTabWidget.North)
+        self.tab_widget.setMovable(False)
+        self.tab_widget.setDocumentMode(True)
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #3f3f46;
+                background: #252526;
+                margin: 0;
+            }
+            QTabBar::tab {
+                background: #252526;
+                color: #a0a0a0;
+                padding: 8px 16px;
+                border: 1px solid #3f3f46;
+                border-bottom: none;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+            }
+            QTabBar::tab:selected, QTabBar::tab:hover {
+                background: #2d2d30;
+                color: #e0e0e0;
+                border-color: #3f3f46;
+            }
+        """)
 
         # 保存初始样式表
         self.initial_style_sheet = self.styleSheet()
-    
+        
         # 顶部工具栏
         top_toolbar = QHBoxLayout()
         top_toolbar.setSpacing(10)
@@ -6301,7 +7753,12 @@ class MusicPlayerApp(QMainWindow):
         self.search_input.setMinimumHeight(36)
         self.search_input.returnPressed.connect(self.start_search) 
         self.source_combo = QComboBox()
-        self.source_combo.addItems(get_source_names())
+        try:
+            self.source_combo.addItems(get_source_names())
+        except NameError:
+            # 如果找不到函数，从全局作用域获取
+            import __main__
+            self.source_combo.addItems(__main__.get_source_names())
         self.source_combo.setCurrentText(self.settings["sources"]["active_source"])
         self.source_combo.setFixedWidth(120)
         search_button = QPushButton("搜索")
@@ -6323,10 +7780,11 @@ class MusicPlayerApp(QMainWindow):
         self.tools_button.setIcon(QIcon.fromTheme("applications-utilities"))
         self.tools_button.setCursor(QCursor(Qt.PointingHandCursor))
     
-        settings_button = QPushButton("设置")
-        settings_button.setIcon(QIcon.fromTheme("preferences-system"))
-        settings_button.setCursor(QCursor(Qt.PointingHandCursor))
-    
+        self.settings_button = QPushButton("设置")
+        self.settings_button.setIcon(QIcon.fromTheme("preferences-system"))
+        self.settings_button.setCursor(QCursor(Qt.PointingHandCursor))
+        self.settings_button.clicked.connect(self.open_settings)
+
         log_button = QPushButton("日志")
         log_button.setIcon(QIcon.fromTheme("text-x-generic"))
         log_button.setCursor(QCursor(Qt.PointingHandCursor))
@@ -6335,12 +7793,17 @@ class MusicPlayerApp(QMainWindow):
         self.bilibili_audio_button.setObjectName("bilibiliButton")
         self.bilibili_audio_button.setIcon(QIcon(":/icons/bilibili.png"))
         self.bilibili_audio_button.setCursor(QCursor(Qt.PointingHandCursor))
-    
+        self.bilibili_audio_button.clicked.connect(self.open_bilibili_audio_search)
+        # 悬浮窗按钮
+        self.float_button = QPushButton("悬浮窗")
+        self.float_button.setStyleSheet("padding: 8px; font-size: 14px; background-color: rgba(70, 130, 180, 200);")
+        self.float_button.clicked.connect(self.toggle_float_window)
+        tools_layout.addWidget(self.float_button)
         self.video_button = QPushButton("视频")
         self.video_button.setObjectName("videoButton")
         self.video_button.setIcon(QIcon.fromTheme("video-x-generic"))
         self.video_button.setCursor(QCursor(Qt.PointingHandCursor))
-
+        tools_layout.addWidget(self.settings_button)
         self.sync_button = QPushButton("设备同步")
         self.sync_button.setIcon(QIcon.fromTheme("network-server"))
         self.sync_button.setCursor(QCursor(Qt.PointingHandCursor))
@@ -6361,115 +7824,6 @@ class MusicPlayerApp(QMainWindow):
         self.sync_button.setToolTip("设备同步服务器")
         self.sync_button.clicked.connect(self.toggle_sync_server)
         tools_layout.addWidget(self.sync_button)
-
-        # =============== 音乐室按钮 ===============
-        self.music_room_button = QPushButton("音乐室")
-        self.music_room_button.setIcon(QIcon.fromTheme("view-media-playlist"))
-        self.music_room_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.music_room_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                font-size: 14px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(123, 104, 238, 200), stop:1 rgba(103, 84, 218, 200));
-                color: white;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(143, 124, 255, 220), stop:1 rgba(123, 104, 238, 220));
-            }
-        """)
-        self.music_room_button.setToolTip("多人音乐室")
-        self.music_room_button.clicked.connect(self.open_music_room)
-        tools_layout.addWidget(self.music_room_button)
-
-        # =============== 用户登录按钮 ===============
-        self.user_button = QPushButton("登录")
-        self.user_button.setIcon(QIcon.fromTheme("system-users"))
-        self.user_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.user_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                font-size: 14px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(60, 179, 113, 200), stop:1 rgba(40, 159, 93, 200));
-                color: white;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(80, 199, 133, 220), stop:1 rgba(60, 179, 113, 220));
-            }
-        """)
-        self.user_button.setToolTip("用户登录")
-        self.user_button.clicked.connect(self.show_login_dialog)
-        tools_layout.addWidget(self.user_button)
-
-        # =============== 音乐室服务器按钮 ===============
-        self.server_button = QPushButton("启动服务器")
-        self.server_button.setIcon(QIcon.fromTheme("network-server-database"))
-        self.server_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.server_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                font-size: 14px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(205, 92, 92, 200), stop:1 rgba(185, 72, 72, 200));
-                color: white;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(225, 112, 112, 220), stop:1 rgba(205, 92, 92, 220));
-            }
-        """)
-        self.server_button.setToolTip("启动/停止音乐室服务器")
-        self.server_button.clicked.connect(self.toggle_music_room_server)
-        tools_layout.addWidget(self.server_button)
-        # =============== 睡眠定时器按钮 ===============
-        self.sleep_timer_button = QPushButton("睡眠定时")
-        self.sleep_timer_button.setIcon(QIcon.fromTheme("player-time"))
-        self.sleep_timer_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.sleep_timer_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                font-size: 14px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(106, 90, 205, 200), stop:1 rgba(86, 70, 185, 200));
-                color: white;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(126, 110, 225, 220), stop:1 rgba(106, 90, 205, 220));
-            }
-        """)
-        self.sleep_timer_button.setToolTip("设置睡眠定时器")
-        self.sleep_timer_button.clicked.connect(self.open_sleep_timer)
-        tools_layout.addWidget(self.sleep_timer_button)
-
-        # =============== 均衡器按钮 ===============
-        self.equalizer_button = QPushButton("均衡器")
-        self.equalizer_button.setIcon(QIcon.fromTheme("audio-card"))
-        self.equalizer_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.equalizer_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                font-size: 14px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(199, 21, 133, 200), stop:1 rgba(179, 1, 113, 200));
-                color: white;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 rgba(219, 41, 153, 220), stop:1 rgba(199, 21, 133, 220));
-            }
-        """)
-        self.equalizer_button.setToolTip("音频均衡器设置")
-        self.equalizer_button.clicked.connect(self.open_equalizer)
-        tools_layout.addWidget(self.equalizer_button)
 
         # =============== 更多功能下拉菜单 ===============
         self.more_button = QPushButton("更多")
@@ -6536,56 +7890,49 @@ class MusicPlayerApp(QMainWindow):
         # 设置按钮菜单
         self.more_button.setMenu(self.more_menu)
         tools_layout.addWidget(self.more_button)
-
-        tools_layout.addWidget(self.tools_button)
-        tools_layout.addWidget(settings_button)
-        tools_layout.addWidget(log_button)
         tools_layout.addWidget(self.bilibili_audio_button)
-        tools_layout.addWidget(self.video_button)
         tools_layout.addStretch()
-
         top_toolbar.addLayout(search_layout, 7)
         top_toolbar.addLayout(tools_layout, 3)
-    
-        main_layout.addLayout(top_toolbar)
-    
-        # 主内容区域
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(15)
-     
+        self.main_layout.addLayout(top_toolbar)
+
+        # 标签页1: 搜索和播放
+        search_play_tab = QWidget()
+        search_play_layout = QHBoxLayout(search_play_tab)
+        search_play_layout.setContentsMargins(0, 0, 0, 0)
+        search_play_layout.setSpacing(15)
+
         # 左侧 - 搜索结果区域
         left_panel = QVBoxLayout()
         left_panel.setSpacing(10)
-    
+
         results_label = QLabel("搜索结果")
         results_label.setStyleSheet("font-size: 16px; font-weight: bold; padding-bottom: 5px;")
-    
-        # 创建results_list并立即设置objectName
+
         self.results_list = QListWidget()
-        self.results_list.setObjectName("resultsList")  # 在这里设置objectName
+        self.results_list.setObjectName("resultsList")
         self.results_list.setIconSize(QSize(80, 80))
         self.results_list.setSpacing(8)
         self.results_list.setAlternatingRowColors(True)
         self.results_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-    
+
         left_panel.addWidget(results_label)
         left_panel.addWidget(self.results_list)
 
-    
         # 右侧 - 歌曲信息和播放控制
         right_panel = QVBoxLayout()
         right_panel.setSpacing(15)
-    
+
         # 歌曲信息面板
         info_group = QGroupBox("歌曲信息")
         info_layout = QVBoxLayout(info_group)
-    
+
         self.song_info = QTextEdit()
-        self.song_info.setObjectName("songInfo") 
+        self.song_info.setObjectName("songInfo")
         self.song_info.setReadOnly(True)
         self.song_info.setMinimumHeight(180)
         info_layout.addWidget(self.song_info)
-    
+
         # 下载按钮
         download_layout = QHBoxLayout()
         self.download_button = QPushButton("下载歌曲")
@@ -6595,50 +7942,47 @@ class MusicPlayerApp(QMainWindow):
         download_layout.addStretch()
         info_layout.addLayout(download_layout)
 
-        # +++ 添加播放本地文件按钮 +++
+        # 播放本地文件按钮
         self.local_file_button = QPushButton("播放本地文件")
         self.local_file_button.setIcon(QIcon.fromTheme("folder-music"))
         self.local_file_button.setToolTip("播放本地音乐文件")
         download_layout.addWidget(self.local_file_button)
 
-        download_layout.addStretch()
-        info_layout.addLayout(download_layout)
-    
         # 播放控制面板
         control_group = QGroupBox("播放控制")
         control_layout = QVBoxLayout(control_group)
-    
+
         # 播放按钮行
         playback_buttons = QHBoxLayout()
         self.prev_button = QPushButton("上一首")
         self.prev_button.setObjectName("prevButton")
         self.prev_button.setIcon(QIcon.fromTheme("media-skip-backward"))
-    
+
         self.play_button = QPushButton("播放")
         self.play_button.setObjectName("playButton")
         self.play_button.setIcon(QIcon.fromTheme("media-playback-start"))
-    
+
         self.pause_button = QPushButton("暂停")
         self.pause_button.setObjectName("pauseButton")
         self.pause_button.setIcon(QIcon.fromTheme("media-playback-pause"))
-    
+
         self.stop_button = QPushButton("停止")
         self.stop_button.setObjectName("stopButton")
         self.stop_button.setIcon(QIcon.fromTheme("media-playback-stop"))
-    
+
         self.next_button = QPushButton("下一首")
         self.next_button.setObjectName("nextButton")
         self.next_button.setIcon(QIcon.fromTheme("media-skip-forward"))
-    
+
         playback_buttons.addWidget(self.prev_button)
         playback_buttons.addWidget(self.play_button)
         playback_buttons.addWidget(self.pause_button)
         playback_buttons.addWidget(self.stop_button)
         playback_buttons.addWidget(self.next_button)
-    
+
         # 进度条行
         progress_layout = QVBoxLayout()
-    
+
         # 时间显示
         time_layout = QHBoxLayout()
         self.current_time_label = QLabel("00:00")
@@ -6647,14 +7991,14 @@ class MusicPlayerApp(QMainWindow):
         self.total_time_label.setAlignment(Qt.AlignRight)
         time_layout.addWidget(self.current_time_label)
         time_layout.addWidget(self.total_time_label)
-    
+
         # 进度条
         self.progress_slider = QSlider(Qt.Horizontal)
         self.progress_slider.setRange(0, 1000)
-    
+
         progress_layout.addLayout(time_layout)
         progress_layout.addWidget(self.progress_slider)
-     
+
         # 音量控制
         volume_layout = QHBoxLayout()
         volume_layout.addWidget(QLabel("音量:"))
@@ -6664,11 +8008,11 @@ class MusicPlayerApp(QMainWindow):
         self.volume_slider.setFixedWidth(120)
         volume_layout.addWidget(self.volume_slider)
         volume_layout.addStretch()
-    
+
         control_layout.addLayout(playback_buttons)
         control_layout.addLayout(progress_layout)
         control_layout.addLayout(volume_layout)
-    
+
         # 歌词按钮
         self.lyrics_button = QPushButton("显示歌词")
         self.lyrics_button.setCheckable(True)
@@ -6679,11 +8023,22 @@ class MusicPlayerApp(QMainWindow):
                 color: white;
             }
         """)
-    
-        # 播放列表区域
-        playlist_group = QGroupBox("播放列表")
-        playlist_layout = QVBoxLayout(playlist_group)
-    
+
+        # 将组件添加到右侧面板
+        right_panel.addWidget(info_group)
+        right_panel.addWidget(control_group)
+        right_panel.addWidget(self.lyrics_button)
+
+        # 将左右面板添加到搜索播放标签页
+        search_play_layout.addLayout(left_panel, 6)
+        search_play_layout.addLayout(right_panel, 4)
+
+        # 标签页2: 播放列表
+        playlist_tab = QWidget()
+        playlist_layout = QVBoxLayout(playlist_tab)
+        playlist_layout.setContentsMargins(10, 10, 10, 10)
+        playlist_layout.setSpacing(10)
+
         # 播放列表控制按钮
         playlist_controls = QHBoxLayout()
         self.play_mode_combo = QComboBox()
@@ -6693,36 +8048,155 @@ class MusicPlayerApp(QMainWindow):
 
         clear_button = QPushButton("清空")
         clear_button.setIcon(QIcon.fromTheme("edit-clear"))
-    
+
         save_button = QPushButton("保存")
         save_button.setIcon(QIcon.fromTheme("document-save"))
-    
+
         playlist_controls.addWidget(QLabel("播放模式:"))
         playlist_controls.addWidget(self.play_mode_combo)
         playlist_controls.addStretch()
         playlist_controls.addWidget(clear_button)
         playlist_controls.addWidget(save_button)
-    
+
         # 播放列表内容
         self.playlist_widget = QListWidget()
-        self.playlist_widget.setObjectName("playlistWidget") 
+        self.playlist_widget.setObjectName("playlistWidget")
         self.playlist_widget.setAlternatingRowColors(True)
         self.playlist_widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-    
+
         playlist_layout.addLayout(playlist_controls)
         playlist_layout.addWidget(self.playlist_widget)
-     
-        # 将组件添加到右侧面板
-        right_panel.addWidget(info_group)
-        right_panel.addWidget(control_group)
-        right_panel.addWidget(self.lyrics_button)
-        right_panel.addWidget(playlist_group)
+
+        # 标签页3: 工具
+        tools_tab = QWidget()
+        tools_layout = QVBoxLayout(tools_tab)
+        tools_layout.setContentsMargins(10, 10, 10, 10)
+        tools_layout.setSpacing(15)
+
+        # 工具按钮网格
+        tools_grid = QGridLayout()
+        tools_grid.setSpacing(10)
+
+        # 第一行工具
+        tools_grid.addWidget(QLabel("音乐工具:"), 0, 0)
+        self.tools_button = QPushButton("工具箱")
+        self.tools_button.setObjectName("toolsButton")
+        self.tools_button.setIcon(QIcon.fromTheme("applications-utilities"))
+        self.tools_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.tools_button, 0, 1)
+
+        tools_grid.addWidget(QLabel("B站音乐:"), 0, 2)
+        self.bilibili_audio_button = QPushButton("B站音乐")
+        self.bilibili_audio_button.setObjectName("bilibiliButton")
+        self.bilibili_audio_button.setIcon(QIcon(":/icons/bilibili.png"))
+        self.bilibili_audio_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.bilibili_audio_button, 0, 3)
+
+        # 第二行工具
+        tools_grid.addWidget(QLabel("视频:"), 1, 0)
+        self.video_button = QPushButton("视频")
+        self.video_button.setObjectName("videoButton")
+        self.video_button.setIcon(QIcon.fromTheme("video-x-generic"))
+        self.video_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.video_button, 1, 1)
+
+        tools_grid.addWidget(QLabel("均衡器:"), 1, 2)
+        self.equalizer_button = QPushButton("均衡器")
+        self.equalizer_button.setIcon(QIcon.fromTheme("audio-card"))
+        self.equalizer_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.equalizer_button, 1, 3)
+
+        # 第三行工具
+        tools_grid.addWidget(QLabel("睡眠定时:"), 2, 0)
+        self.sleep_timer_button = QPushButton("睡眠定时")
+        self.sleep_timer_button.setIcon(QIcon.fromTheme("player-time"))
+        self.sleep_timer_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.sleep_timer_button, 2, 1)
+
+        tools_grid.addWidget(QLabel("日志:"), 2, 2)
+        log_button = QPushButton("日志")
+        log_button.setIcon(QIcon.fromTheme("text-x-generic"))
+        log_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(log_button, 2, 3)
+
+        # 第四行工具
+        tools_grid.addWidget(QLabel("设备同步:"), 3, 0)
+        self.sync_button = QPushButton("设备同步")
+        self.sync_button.setIcon(QIcon.fromTheme("network-server"))
+        self.sync_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.sync_button, 3, 1)
+
+        tools_grid.addWidget(QLabel("音乐室:"), 3, 2)
+        self.music_room_button = QPushButton("音乐室")
+        self.music_room_button.setIcon(QIcon.fromTheme("view-media-playlist"))
+        self.music_room_button.setCursor(QCursor(Qt.PointingHandCursor))
+        tools_grid.addWidget(self.music_room_button, 3, 3)
+
+        tools_layout.addLayout(tools_grid)
+        tools_layout.addStretch()
+
+        # 添加小游戏选项
+        games_group = QGroupBox("小游戏")
+        games_layout = QVBoxLayout(games_group)
+        
+        # 贪吃蛇按钮
+        snake_button = QPushButton("贪吃蛇")
+        snake_button.setIcon(QIcon(":/icons/snake.png"))
+        snake_button.setStyleSheet("font-size: 14px; padding: 10px;")
+        snake_button.clicked.connect(self.open_snake_game)
+        
+        # 国际象棋按钮
+        chess_button = QPushButton("国际象棋")
+        chess_button.setIcon(QIcon(":/icons/chess.png"))
+        chess_button.setStyleSheet("font-size: 14px; padding: 10px;")
+        chess_button.clicked.connect(self.open_chess_game)
+        
+        # 添加到布局
+        games_layout.addWidget(snake_button)
+        games_layout.addWidget(chess_button)
+        
+        # 添加到工具标签页
+        tools_layout.addWidget(games_group)
+        tools_layout.addStretch()
+
+        # 标签页4: 设置
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setContentsMargins(10, 10, 10, 10)
+        settings_layout.setSpacing(15)
+
+        # 创建嵌入式设置面板
+        self.settings_panel = QWidget()
+        settings_panel_layout = QVBoxLayout(self.settings_panel)
+
+        # 创建滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(self.settings_panel)
+        settings_layout.addWidget(scroll_area)
+
+        # 设置保存按钮
+        button_layout = QHBoxLayout()
+        self.save_settings_btn = QPushButton("保存设置")
+        self.save_settings_btn.setIcon(QIcon.fromTheme("document-save"))
+        button_layout.addWidget(self.save_settings_btn, alignment=Qt.AlignRight)
+
+        settings_layout.addLayout(button_layout)
+
+        # 添加标签页
+        #self.tab_widget.addTab(settings_tab, "设置")
+
+        # 初始化设置面板内容
+        self.init_settings_panel()
+        # =============== 初始化设置面板 ===============
+                
+        self.save_settings_btn.clicked.connect(self.save_settings_from_panel)
+        # 添加标签页
+        self.tab_widget.addTab(search_play_tab, "搜索播放")
+        self.tab_widget.addTab(playlist_tab, "播放列表")
+        self.tab_widget.addTab(tools_tab, "工具")
     
-        # 将左右面板添加到内容布局
-        content_layout.addLayout(left_panel, 6)
-        content_layout.addLayout(right_panel, 4)
-    
-        main_layout.addLayout(content_layout)
+        self.main_layout.addWidget(self.tab_widget)
     
         # 状态栏
         self.status_bar = QStatusBar()
@@ -6772,7 +8246,6 @@ class MusicPlayerApp(QMainWindow):
     
         # 连接信号
         search_button.clicked.connect(self.start_search)
-        settings_button.clicked.connect(self.open_settings)
         log_button.clicked.connect(self.open_log_console)
         self.bilibili_audio_button.clicked.connect(self.open_bilibili_audio_search)
         self.video_button.clicked.connect(self.open_video_player)
@@ -6789,49 +8262,6 @@ class MusicPlayerApp(QMainWindow):
         self.results_list.itemClicked.connect(self.song_selected)
         self.playlist_widget.itemDoubleClicked.connect(self.play_playlist_item)
         self.set_background()
-        # 设备切换按钮
-        device_layout = QHBoxLayout()
-        device_layout.addWidget(QLabel("播放设备:"))
-
-        self.device_computer = QPushButton("电脑")
-        self.device_computer.setCheckable(True)
-        self.device_computer.setChecked(True)
-        self.device_computer.setObjectName("deviceComputer")
-        self.device_computer.setStyleSheet("""
-            QPushButton {
-                padding: 6px;
-                background-color: #3a5a98;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:checked {
-                background-color: #1e3a68;
-            }
-        """)
-        self.device_computer.clicked.connect(lambda: self.switch_playback_device("computer"))
-
-        self.device_phone = QPushButton("手机")
-        self.device_phone.setCheckable(True)
-        self.device_phone.setObjectName("devicePhone")
-        self.device_phone.setStyleSheet("""
-            QPushButton {
-                padding: 6px;
-                background-color: #4a7a4a;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:checked {
-                background-color: #2a5a2a;
-            }
-        """)
-        self.device_phone.clicked.connect(lambda: self.switch_playback_device("phone"))
-
-        device_layout.addWidget(self.device_computer)
-        device_layout.addWidget(self.device_phone)
-        device_layout.addStretch()
-
-        # 添加到控制面板
-        control_layout.addLayout(device_layout)
 
     def toggle_sync_server(self):
         """切换设备同步服务器状态"""
@@ -6877,6 +8307,141 @@ class MusicPlayerApp(QMainWindow):
         layout.addWidget(button_box)
         dialog.setLayout(layout)
         dialog.exec_()
+    
+    def init_title_bar(self):
+        """初始化自定义标题栏"""
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        # 创建标题栏容器
+        self.title_bar = QWidget()
+        self.title_bar.setFixedHeight(30)
+        self.title_bar.setStyleSheet("""
+            QWidget {
+                background-color: #2d2d30;
+                color: #d4d4d4;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+        """)
+        
+        # 标题栏布局
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(5, 0, 5, 0)
+        title_layout.setSpacing(5)
+        # 标题图标
+        icon_label = QLabel()
+        icon_pixmap = QPixmap(":/icons/app.jpg").scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        icon_label.setPixmap(icon_pixmap)
+        
+        # 标题文本
+        self.title_label = QLabel("Railgun_loverのMusicPlayer")
+        self.title_label.setStyleSheet("""
+            QLabel {
+                color: #d4d4d4;
+                font-weight: bold;
+            }
+        """)
+        
+        # 空白区域
+        title_layout.addWidget(icon_label)
+        title_layout.addWidget(self.title_label)
+        title_layout.addStretch()
+        #窗口控制按钮
+        min_button = QPushButton("—")
+        min_button.setFixedSize(25, 25)
+        min_button.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #d4d4d4;
+                border: none;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #3d3d40;
+            }
+        """)
+        min_button.clicked.connect(self.showMinimized)
+        
+        max_button = QPushButton("□")
+        max_button.setFixedSize(25, 25)
+        max_button.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #d4d4d4;
+                border: none;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #3d3d40;
+            }
+        """)
+        max_button.clicked.connect(self.toggle_maximize)
+        
+        close_button = QPushButton("×")
+        close_button.setFixedSize(25, 25)
+        close_button.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #d4d4d4;
+                border: none;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #e81123;
+            }
+        """)
+        close_button.clicked.connect(self.close)
+        
+        title_layout.addWidget(min_button)
+        title_layout.addWidget(max_button)
+        title_layout.addWidget(close_button)
+        
+        # 将标题栏添加到主布局
+        if self.main_layout is not None:
+            self.main_layout.insertWidget(0, self.title_bar)
+    
+
+    def add_window_controls_to_more_menu(self):
+        """添加窗口控制按钮到更多菜单"""
+        # 最小化动作
+        minimize_action = QAction("最小化", self)
+        minimize_action.triggered.connect(self.showMinimized)
+        
+        # 最大化/还原动作
+        self.toggle_maximize_action = QAction("最大化", self)
+        self.toggle_maximize_action.triggered.connect(self.toggle_maximize)
+        
+        # 关闭动作
+        close_action = QAction("关闭", self)
+        close_action.triggered.connect(self.close)
+        
+        # 添加到更多菜单
+        self.more_menu.addSeparator()
+        self.more_menu.addAction(minimize_action)
+        self.more_menu.addAction(self.toggle_maximize_action)
+        self.more_menu.addAction(close_action)
+
+    def toggle_maximize(self):
+        """切换最大化/还原状态"""
+        if self.is_maximized:
+            self.showNormal()
+            self.toggle_maximize_action.setText("最大化")
+            self.is_maximized = False
+        else:
+            self.showMaximized()
+            self.toggle_maximize_action.setText("还原")
+            self.is_maximized = True
+    
+    def mousePressEvent(self, event):
+        """鼠标按下事件，支持通过标题栏拖动窗口"""
+        if event.button() == Qt.LeftButton and self.title_bar.underMouse():
+            self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        """鼠标移动事件，支持窗口拖动"""
+        if event.buttons() == Qt.LeftButton and hasattr(self, 'drag_position'):
+            self.move(event.globalPos() - self.drag_position)
+            event.accept()
 
     def handle_login(self, username, password, dialog):
         """处理登录请求"""
@@ -6900,6 +8465,17 @@ class MusicPlayerApp(QMainWindow):
             self.server_button.setText("启动服务器")
             self.status_bar.showMessage("音乐室服务器已停止")
 
+    def toggle_float_window(self):
+        """切换悬浮窗显示状态"""
+        if not self.float_window:
+            self.float_window = FloatWindow(self)
+            self.float_window.show()
+            self.float_button.setText("关闭悬浮窗")
+        else:
+            self.float_window.close()
+            self.float_window = None
+            self.float_button.setText("悬浮窗")
+        
     def open_playlist_manager(self):
         """打开播放列表管理对话框"""
         dialog = PlaylistDialog(self.playlist_manager, self)
@@ -7221,7 +8797,21 @@ class MusicPlayerApp(QMainWindow):
                 'command': 'load',
                 'file_path': file_path
             })
-    
+    def open_settings(self):
+        dialog = SettingsDialog(self)
+
+        # 连接歌词设置更新信号
+        dialog.lyrics_settings_updated.connect(self.update_lyrics_style)
+
+        if dialog.exec_() == QDialog.Accepted:
+            self.settings = load_settings()
+            self.source_combo.clear()
+            self.source_combo.addItems(get_source_names())
+            self.source_combo.setCurrentText(self.settings["sources"]["active_source"])
+            self.set_background()
+            self.create_necessary_dirs()
+            QMessageBox.information(self, "设置", "设置已保存！")
+            
     def on_player_state_changed(self, state):
         """播放状态改变时发送同步消息"""
         if state == QMediaPlayer.PlayingState:
@@ -7353,7 +8943,8 @@ class MusicPlayerApp(QMainWindow):
             self.sync_server.stop()
         if self.sync_client.running:
             self.sync_client.disconnect()
-        
+        if self.float_window:
+            self.float_window.close()
         super().closeEvent(event)
 
     def toggle_lyrics_window(self):
@@ -8148,6 +9739,21 @@ class MusicPlayerApp(QMainWindow):
         search_dialog = AudioSearchDialog(self, cookie)
         search_dialog.exec_()
         
+    def on_bilibili_download_complete(self, file_path):
+        """B站音频下载完成后的处理"""
+        if file_path and os.path.exists(file_path):
+            # 添加到播放列表
+            self.add_to_playlist(file_path)
+            
+            # 如果设置了自动播放，则播放该文件
+            if self.settings["other"].get("auto_play", True):
+                self.play_file(file_path)
+                
+            self.status_bar.showMessage(f"B站音频下载完成: {os.path.basename(file_path)}")
+            
+            # 记录日志
+            logger.info(f"B站音频下载完成并添加到播放列表: {file_path}")
+
     def open_bilibili_search(self):
         if not self.current_song_info:
             self.status_bar.showMessage("没有选中的歌曲")
@@ -8252,25 +9858,8 @@ class MusicPlayerApp(QMainWindow):
         self.play_button.setEnabled(state != QMediaPlayer.PlayingState)
         self.pause_button.setEnabled(state == QMediaPlayer.PlayingState)
         self.stop_button.setEnabled(state != QMediaPlayer.StoppedState)
-
-    def open_settings(self):
-        dialog = SettingsDialog(self)
-
-        # 连接歌词设置更新信号
-        dialog.lyrics_settings_updated.connect(self.update_lyrics_style)
-
-        if dialog.exec_() == QDialog.Accepted:
-            self.settings = load_settings()
-            self.source_combo.clear()
-            self.source_combo.addItems(get_source_names())
-            self.source_combo.setCurrentText(self.settings["sources"]["active_source"])
-            self.set_background()
-            self.create_necessary_dirs()
-            QMessageBox.information(self, "设置", "设置已保存！")
         
     def setup_connections(self):
-        self.device_computer.clicked.connect(lambda: self.switch_playback_device("computer"))
-        self.device_phone.clicked.connect(lambda: self.switch_playback_device("phone"))
         self.media_player.stateChanged.connect(self.update_button_states)
         self.media_player.positionChanged.connect(self.update_progress)
         self.local_file_button.clicked.connect(self.play_custom_file)
@@ -9060,134 +10649,6 @@ class MusicPlayerApp(QMainWindow):
             return True
         return False
     
-    def switch_playback_device(self, device):
-        """切换播放设备"""
-        if device == self.current_device:
-            return  # 已经是目标设备，无需切换
-    
-        logger.info(f"切换播放设备: {self.current_device} -> {device}")
-    
-        if device == "computer":
-            # 切换到电脑播放
-            self.switch_to_computer_playback()
-        elif device == "phone":
-            # 切换到手机播放
-            self.switch_to_phone_playback()
-        else:
-            logger.warning(f"未知设备类型: {device}")
-            return
-    
-        # 更新当前设备状态
-        self.current_device = device
-    
-        # 更新UI
-        self.update_device_ui()
-    
-        # 保存设置
-        self.save_device_setting(device)
-
-    def switch_to_computer_playback(self):
-        """切换到电脑播放"""
-        logger.info("切换到电脑播放")
-    
-        # 停止手机播放（如果正在播放）
-        if self.phone_player and self.phone_player.is_playing():
-            self.phone_player.stop()
-    
-        # 恢复电脑播放状态
-        if self.current_song_path:
-            self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.current_song_path)))
-        
-            # 恢复播放位置
-            if self.last_play_position > 0:
-                self.media_player.setPosition(self.last_play_position)
-        
-            # 恢复播放状态
-            if self.was_playing:
-                self.media_player.play()
-    
-        # 更新状态栏
-        self.status_bar.showMessage("已切换到电脑播放")
-
-    def switch_to_phone_playback(self):
-        """切换到手机播放"""
-        logger.info("切换到手机播放")
-    
-        # 保存电脑播放状态
-        self.was_playing = self.media_player.state() == QMediaPlayer.PlayingState
-        self.last_play_position = self.media_player.position()
-    
-        # 停止电脑播放
-        self.media_player.stop()
-    
-        # 初始化手机播放器（如果尚未初始化）
-        if self.phone_player is None:
-            self.phone_player = PhonePlayer(self)
-    
-        # 发送当前歌曲到手机
-        if self.current_song_path:
-            # 检查文件是否存在
-            if not os.path.exists(self.current_song_path):
-                logger.error(f"歌曲文件不存在: {self.current_song_path}")
-                QMessageBox.warning(self, "错误", "歌曲文件不存在")
-                return
-            
-            # 发送歌曲到手机
-            try:
-                self.phone_player.play_song(self.current_song_path, self.last_play_position)
-            
-                # 恢复播放状态
-                if self.was_playing:
-                    self.phone_player.play()
-            except Exception as e:
-                logger.error(f"发送歌曲到手机失败: {str(e)}")
-                QMessageBox.critical(self, "错误", f"无法发送歌曲到手机:\n{str(e)}")
-    
-        # 更新状态栏
-        self.status_bar.showMessage("已切换到手机播放")
-
-    def update_device_ui(self):
-        """更新设备切换UI状态"""
-        # 更新设备按钮状态
-        self.device_computer.setChecked(self.current_device == "computer")
-        self.device_phone.setChecked(self.current_device == "phone")
-    
-        # 更新播放控制按钮状态
-        is_computer = self.current_device == "computer"
-        self.play_button.setEnabled(is_computer)
-        self.pause_button.setEnabled(is_computer)
-        self.stop_button.setEnabled(is_computer)
-        self.prev_button.setEnabled(is_computer)
-        self.next_button.setEnabled(is_computer)
-    
-        # 更新进度条状态
-        self.progress_slider.setEnabled(is_computer)
-    
-        # 更新音量控制状态
-        self.volume_slider.setEnabled(is_computer)
-    
-        # 更新手机控制按钮
-        if hasattr(self, 'phone_control_button'):
-            self.phone_control_button.setEnabled(not is_computer)
-
-    def save_device_setting(self, device):
-        """保存设备设置"""
-        settings = load_settings()
-        settings["playback_device"] = device
-        save_settings(settings)
-    
-        logger.info(f"保存播放设备设置: {device}")
-
-    def load_device_setting(self):
-        """加载设备设置"""
-        settings = load_settings()
-        self.current_device = settings.get("playback_device", "computer")
-    
-        # 更新UI
-        self.update_device_ui()
-    
-        logger.info(f"加载播放设备设置: {self.current_device}")
-    
     def get_files(self, path):
         """获取指定路径下的文件列表"""
         # 安全限制：只能访问音乐目录
@@ -9309,6 +10770,492 @@ class MusicPlayerApp(QMainWindow):
         except ImportError:
             QMessageBox.warning(self, "错误", "需要安装qrcode和Pillow库")
 
+class SnakeGame(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("贪吃蛇")
+        self.setFixedSize(600, 600)
+        self.setStyleSheet("background-color: #1e1e1e;")
+        
+        # 游戏区域
+        self.board_size = 20
+        self.cell_size = 30
+        self.snake = [(10, 10), (10, 9), (10, 8)]
+        self.direction = (0, 1)  # 初始向下移动
+        self.food = self.generate_food()
+        self.score = 0
+        self.game_over = False
+        
+        # 定时器
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.move_snake)
+        self.timer.start(200)  # 每200毫秒移动一次
+        
+        # 按键事件
+        self.setFocusPolicy(Qt.StrongFocus)
+    
+    def generate_food(self):
+        """生成食物位置"""
+        while True:
+            food = (random.randint(0, self.board_size-1), 
+                    random.randint(0, self.board_size-1))
+            if food not in self.snake:
+                return food
+    
+    def move_snake(self):
+        """移动蛇"""
+        if self.game_over:
+            return
+            
+        # 计算新的头部位置
+        head_x, head_y = self.snake[0]
+        dx, dy = self.direction
+        new_head = ((head_x + dx) % self.board_size, 
+                    (head_y + dy) % self.board_size)
+        
+        # 检查是否撞到自己
+        if new_head in self.snake:
+            self.game_over = True
+            self.timer.stop()
+            self.update()
+            return
+            
+        # 添加新的头部
+        self.snake.insert(0, new_head)
+        
+        # 检查是否吃到食物
+        if new_head == self.food:
+            self.score += 10
+            self.food = self.generate_food()
+        else:
+            # 如果没有吃到食物，移除尾部
+            self.snake.pop()
+            
+        self.update()
+    
+    def keyPressEvent(self, event):
+        """处理按键事件"""
+        if self.game_over:
+            if event.key() == Qt.Key_R:
+                self.reset_game()
+            return
+            
+        key = event.key()
+        if key == Qt.Key_Up and self.direction != (0, 1):
+            self.direction = (0, -1)
+        elif key == Qt.Key_Down and self.direction != (0, -1):
+            self.direction = (0, 1)
+        elif key == Qt.Key_Left and self.direction != (1, 0):
+            self.direction = (-1, 0)
+        elif key == Qt.Key_Right and self.direction != (-1, 0):
+            self.direction = (1, 0)
+    
+    def reset_game(self):
+        """重置游戏"""
+        self.snake = [(10, 10), (10, 9), (10, 8)]
+        self.direction = (0, 1)
+        self.food = self.generate_food()
+        self.score = 0
+        self.game_over = False
+        self.timer.start(200)
+        self.update()
+    
+    def paintEvent(self, event):
+        """绘制游戏界面"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 绘制背景
+        painter.fillRect(0, 0, self.width(), self.height(), QColor(30, 30, 30))
+        
+        # 绘制网格
+        painter.setPen(QColor(60, 60, 60))
+        for i in range(self.board_size + 1):
+            # 水平线
+            painter.drawLine(0, i * self.cell_size, 
+                            self.board_size * self.cell_size, i * self.cell_size)
+            # 垂直线
+            painter.drawLine(i * self.cell_size, 0, 
+                            i * self.cell_size, self.board_size * self.cell_size)
+        
+        # 绘制食物
+        food_x, food_y = self.food
+        painter.setBrush(QColor(255, 0, 0))
+        painter.drawEllipse(food_x * self.cell_size, food_y * self.cell_size, 
+                           self.cell_size, self.cell_size)
+        
+        # 绘制蛇
+        for i, (x, y) in enumerate(self.snake):
+            if i == 0:  # 蛇头
+                painter.setBrush(QColor(0, 200, 0))
+            else:  # 蛇身
+                painter.setBrush(QColor(0, 150, 0))
+                
+            painter.drawRect(x * self.cell_size, y * self.cell_size, 
+                            self.cell_size, self.cell_size)
+        
+        # 绘制分数
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont("Arial", 16))
+        painter.drawText(10, 30, f"分数: {self.score}")
+        
+        # 游戏结束提示
+        if self.game_over:
+            painter.setPen(QColor(255, 0, 0))
+            painter.setFont(QFont("Arial", 24, QFont.Bold))
+            painter.drawText(self.width()//2 - 100, self.height()//2 - 30, 
+                            "游戏结束!")
+            painter.setFont(QFont("Arial", 16))
+            painter.drawText(self.width()//2 - 100, self.height()//2 + 10, 
+                            f"最终分数: {self.score}")
+            painter.drawText(self.width()//2 - 100, self.height()//2 + 40, 
+                            "按 R 键重新开始")
+        
+class ChessGame(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("国际象棋")
+        self.setFixedSize(640, 640)
+        self.setStyleSheet("background-color: #1e1e1e;")
+        
+        # 棋盘设置
+        self.board_size = 8
+        self.cell_size = 70
+        self.selected_piece = None
+        self.valid_moves = [] 
+        self.current_player = "white"  # white 或 black
+        self.board = self.initialize_board()
+        
+        # 游戏状态
+        self.game_over = False
+        self.winner = None
+    
+    def initialize_board(self):
+        """初始化棋盘，白方在上方，黑方在下方"""
+        board = [[None for _ in range(self.board_size)] for _ in range(self.board_size)]
+        
+        # 放置白方棋子
+        board[7][0] = Rook("white")
+        board[7][1] = Knight("white")
+        board[7][2] = Bishop("white")
+        board[7][3] = Queen("white")
+        board[7][4] = King("white")
+        board[7][5] = Bishop("white")
+        board[7][6] = Knight("white")
+        board[7][7] = Rook("white")
+        for i in range(8):
+            board[6][i] = Pawn("white")
+        
+        # 放置黑方棋子
+        board[0][0] = Rook("black")
+        board[0][1] = Knight("black")
+        board[0][2] = Bishop("black")
+        board[0][3] = Queen("black")
+        board[0][4] = King("black")
+        board[0][5] = Bishop("black")
+        board[0][6] = Knight("black")
+        board[0][7] = Rook("black")
+        for i in range(8):
+            board[1][i] = Pawn("black")
+            
+        return board
+    
+    def mousePressEvent(self, event):
+        """处理鼠标点击事件"""
+        if self.game_over:
+            return
+            
+        x = event.x()
+        y = event.y()
+        
+        # 计算点击的棋盘位置
+        col = x // self.cell_size
+        row = y // self.cell_size
+        
+        if 0 <= row < self.board_size and 0 <= col < self.board_size:
+            piece = self.board[row][col]
+            
+            if self.selected_piece:
+                # 尝试移动棋子
+                if (row, col) in self.valid_moves:
+                    self.move_piece(self.selected_piece[0], self.selected_piece[1], row, col)
+                    self.selected_piece = None
+                    self.valid_moves = []
+                    # 切换玩家
+                    self.current_player = "black" if self.current_player == "white" else "white"
+                else:
+                    # 选择其他棋子
+                    if piece and piece.color == self.current_player:
+                        self.selected_piece = (row, col)
+                        self.calculate_valid_moves(row, col)
+                    else:
+                        self.selected_piece = None
+                        self.valid_moves = []
+            else:
+                # 选择棋子
+                if piece and piece.color == self.current_player:
+                    self.selected_piece = (row, col)
+                    self.calculate_valid_moves(row, col)
+            
+            self.update()
+    
+    def calculate_valid_moves(self, row, col):
+        """计算当前选中棋子的所有有效移动"""
+        self.valid_moves = []
+        piece = self.board[row][col]
+        if not piece:
+            return
+            
+        # 检查所有可能的移动
+        for to_row in range(self.board_size):
+            for to_col in range(self.board_size):
+                if piece.is_valid_move(row, col, to_row, to_col, self.board):
+                    self.valid_moves.append((to_row, to_col))
+    
+    def move_piece(self, from_row, from_col, to_row, to_col):
+        """移动棋子"""
+        piece = self.board[from_row][from_col]
+        if piece:
+            piece.move(from_row, from_col, to_row, to_col, self.board)
+            self.board[to_row][to_col] = piece
+            self.board[from_row][from_col] = None
+    
+    def paintEvent(self, event):
+        """绘制游戏界面"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 绘制棋盘
+        for row in range(self.board_size):
+            for col in range(self.board_size):
+                x = col * self.cell_size
+                y = row * self.cell_size
+                
+                # 棋盘格子颜色
+                if (row + col) % 2 == 0:
+                    painter.setBrush(QColor(240, 217, 181))  # 浅色
+                else:
+                    painter.setBrush(QColor(181, 136, 99))   # 深色
+                    
+                painter.drawRect(x, y, self.cell_size, self.cell_size)
+                
+                # 绘制有效移动位置
+                if (row, col) in self.valid_moves:
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setPen(QPen(QColor(0, 255, 0), 3))
+                    painter.drawRect(x, y, self.cell_size, self.cell_size)
+                    painter.setPen(Qt.black)
+                
+                # 绘制选中的格子
+                if self.selected_piece and self.selected_piece[0] == row and self.selected_piece[1] == col:
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setPen(QPen(QColor(0, 0, 255), 3))
+                    painter.drawRect(x, y, self.cell_size, self.cell_size)
+                    painter.setPen(Qt.black)
+                
+                # 绘制棋子
+                piece = self.board[row][col]
+                if piece:
+                    piece_color = QColor(255, 255, 255) if piece.color == "white" else QColor(0, 0, 0)
+                    text_color = QColor(0, 0, 0) if piece.color == "white" else QColor(255, 255, 255)
+                    
+                    # 绘制棋子背景
+                    painter.setBrush(piece_color)
+                    painter.drawEllipse(x + 5, y + 5, self.cell_size - 10, self.cell_size - 10)
+                    
+                    # 绘制棋子符号
+                    painter.setPen(text_color)
+                    painter.setFont(QFont("Arial", 24))
+                    painter.drawText(x + self.cell_size//2 - 10, y + self.cell_size//2 + 10, piece.symbol)
+        
+        # 绘制当前玩家
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont("Arial", 16))
+        painter.drawText(10, 20, f"当前玩家: {'白方' if self.current_player == 'white' else '黑方'}")
+        
+        # 游戏结束提示
+        if self.game_over:
+            painter.setPen(QColor(255, 0, 0))
+            painter.setFont(QFont("Arial", 24, QFont.Bold))
+            painter.drawText(self.width()//2 - 100, self.height()//2 - 30, 
+                            f"{'白方' if self.winner == 'white' else '黑方'}获胜!")
+            painter.setFont(QFont("Arial", 16))
+            painter.drawText(self.width()//2 - 100, self.height()//2 + 10, 
+                            "游戏结束")
+            
+class ChessPiece:
+    def __init__(self, color):
+        self.color = color
+        self.symbol = ""
+        self.has_moved = False
+
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        return False
+    
+    def move(self, from_row, from_col, to_row, to_col, board):
+        """执行移动并更新状态"""
+        if self.is_valid_move(from_row, from_col, to_row, to_col, board):
+            self.has_moved = True
+            return True
+        return False
+
+class Pawn(ChessPiece):
+    def __init__(self, color):
+        super().__init__(color)
+        self.symbol = "♙" if color == "white" else "♟"
+        
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        # 确定兵的方向：白兵向上移动，黑兵向下移动
+        direction = -1 if self.color == "white" else 1
+        
+        # 检查是否在起始位置
+        start_row = 6 if self.color == "white" else 1
+        
+        # 向前移动一格
+        if from_col == to_col and to_row == from_row + direction:
+            return board[to_row][to_col] is None
+            
+        # 起始位置向前移动两格
+        if not self.has_moved and from_row == start_row and from_col == to_col and to_row == from_row + 2 * direction:
+            # 检查路径上是否有棋子
+            if board[from_row + direction][to_col] is None and board[to_row][to_col] is None:
+                return True
+            return False
+            
+        # 斜吃（对角线移动）
+        if abs(to_col - from_col) == 1 and to_row == from_row + direction:
+            target = board[to_row][to_col]
+            return target is not None and target.color != self.color
+            
+        return False
+
+class Rook(ChessPiece):
+    def __init__(self, color):
+        super().__init__(color)
+        self.symbol = "♖" if color == "white" else "♜"
+        
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        # 只能横向或纵向移动
+        if from_row != to_row and from_col != to_col:
+            return False
+            
+        # 检查路径上是否有其他棋子
+        if from_row == to_row:  # 横向移动
+            start = min(from_col, to_col) + 1
+            end = max(from_col, to_col)
+            for col in range(start, end):
+                if board[from_row][col] is not None:
+                    return False
+        else:  # 纵向移动
+            start = min(from_row, to_row) + 1
+            end = max(from_row, to_row)
+            for row in range(start, end):
+                if board[row][from_col] is not None:
+                    return False
+                    
+        # 目标位置可以是空的或有对方棋子
+        target = board[to_row][to_col]
+        return target is None or target.color != self.color
+
+class Knight(ChessPiece):
+    def __init__(self, color):
+        super().__init__(color)
+        self.symbol = "♘" if color == "white" else "♞"
+        
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        # L形移动
+        row_diff = abs(to_row - from_row)
+        col_diff = abs(to_col - from_col)
+        if not ((row_diff == 2 and col_diff == 1) or (row_diff == 1 and col_diff == 2)):
+            return False
+            
+        # 目标位置可以是空的或有对方棋子
+        target = board[to_row][to_col]
+        return target is None or target.color != self.color
+
+class Bishop(ChessPiece):
+    def __init__(self, color):
+        super().__init__(color)
+        self.symbol = "♗" if color == "white" else "♝"
+        
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        # 只能对角线移动
+        if abs(to_row - from_row) != abs(to_col - from_col):
+            return False
+            
+        # 检查路径上是否有其他棋子
+        row_step = 1 if to_row > from_row else -1
+        col_step = 1 if to_col > from_col else -1
+        steps = abs(to_row - from_row)
+        
+        for i in range(1, steps):
+            row = from_row + i * row_step
+            col = from_col + i * col_step
+            if board[row][col] is not None:
+                return False
+                
+        # 目标位置可以是空的或有对方棋子
+        target = board[to_row][to_col]
+        return target is None or target.color != self.color
+
+class Queen(ChessPiece):
+    def __init__(self, color):
+        super().__init__(color)
+        self.symbol = "♕" if color == "white" else "♛"
+        
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        # 结合车和象的移动规则
+        rook_move = (from_row == to_row or from_col == to_col)
+        bishop_move = (abs(to_row - from_row) == abs(to_col - from_col))
+        
+        if not (rook_move or bishop_move):
+            return False
+            
+        # 检查路径上是否有其他棋子
+        if rook_move:
+            if from_row == to_row:  # 横向移动
+                start = min(from_col, to_col) + 1
+                end = max(from_col, to_col)
+                for col in range(start, end):
+                    if board[from_row][col] is not None:
+                        return False
+            else:  # 纵向移动
+                start = min(from_row, to_row) + 1
+                end = max(from_row, to_row)
+                for row in range(start, end):
+                    if board[row][from_col] is not None:
+                        return False
+        else:  # 对角线移动
+            row_step = 1 if to_row > from_row else -1
+            col_step = 1 if to_col > from_col else -1
+            steps = abs(to_row - from_row)
+            
+            for i in range(1, steps):
+                row = from_row + i * row_step
+                col = from_col + i * col_step
+                if board[row][col] is not None:
+                    return False
+                    
+        # 目标位置可以是空的或有对方棋子
+        target = board[to_row][to_col]
+        return target is None or target.color != self.color
+
+class King(ChessPiece):
+    def __init__(self, color):
+        super().__init__(color)
+        self.symbol = "♔" if color == "white" else "♚"
+        
+    def is_valid_move(self, from_row, from_col, to_row, to_col, board):
+        # 只能移动一格
+        row_diff = abs(to_row - from_row)
+        col_diff = abs(to_col - from_col)
+        if row_diff > 1 or col_diff > 1:
+            return False
+            
+        # 目标位置可以是空的或有对方棋子
+        target = board[to_row][to_col]
+        return target is None or target.color != self.color
+    
 class MusicRoomServer(QObject):
     started = pyqtSignal(int)  # 信号：服务器启动成功，参数为端口号
     stopped = pyqtSignal()     # 信号：服务器停止
